@@ -1,0 +1,961 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Language {
+  EN
+  NY
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum RestaurantStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+  REMOVED
+}
+
+enum PermissionEffect {
+  ALLOW
+  DENY
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum SaleSource {
+  ITEMIZED
+  MANUAL
+}
+
+enum SaleStatus {
+  COMPLETED
+  VOIDED
+}
+
+enum ExpenseStatus {
+  ACTIVE
+  VOIDED
+}
+
+enum StockPurchaseStatus {
+  RECEIVED
+  VOIDED
+}
+
+enum StockMovementType {
+  OPENING
+  PURCHASE
+  CONSUMPTION
+  ADJUSTMENT
+  WASTAGE
+  RETURN
+}
+
+enum StockReferenceType {
+  SALE
+  STOCK_PURCHASE
+  ADJUSTMENT
+  OPENING
+  WASTAGE
+  RETURN
+}
+
+enum OwnerTransactionType {
+  WITHDRAWAL
+  CONTRIBUTION
+}
+
+enum OwnerTransactionStatus {
+  ACTIVE
+  VOIDED
+}
+
+enum DailyClosingStatus {
+  OPEN
+  CLOSED
+}
+
+enum NotificationType {
+  LOW_STOCK
+  DAILY_SUMMARY
+  CLOSING_REMINDER
+  HIGH_EXPENSE
+  MISSING_RECORD
+  SYNC_SUCCESS
+  SYNC_FAILED
+}
+
+enum NotificationSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum SyncDirection {
+  PUSH
+  PULL
+}
+
+enum SyncStatus {
+  PENDING
+  SYNCED
+  CONFLICT
+  FAILED
+}
+
+enum DocumentType {
+  SALE
+  EXPENSE
+  STOCK_PURCHASE
+  OWNER_TRANSACTION
+}
+
+// ---------------------------------------------------------------------------
+// Identity and tenancy
+// ---------------------------------------------------------------------------
+
+model User {
+  id                 String     @id @default(uuid(7)) @db.Uuid
+  phone              String     @unique @db.VarChar(20)
+  email              String?    @unique @db.VarChar(254)
+  fullName           String     @map("full_name") @db.VarChar(150)
+  passwordHash       String     @map("password_hash") @db.VarChar(255)
+  language           Language   @default(EN)
+  status             UserStatus @default(ACTIVE)
+  mustChangePassword Boolean    @default(false) @map("must_change_password")
+  lastLoginAt        DateTime?  @map("last_login_at") @db.Timestamptz(3)
+  deactivatedAt      DateTime?  @map("deactivated_at") @db.Timestamptz(3)
+  createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurantsOwned          Restaurant[]          @relation("RestaurantOwner")
+  memberships               RestaurantUser[]      @relation("MembershipUser")
+  membershipsInvited        RestaurantUser[]      @relation("MembershipInvitedBy")
+  refreshTokens             RefreshToken[]
+  devices                   Device[]
+  productsCreated           Product[]             @relation("ProductCreatedBy")
+  priceChanges              ProductPriceHistory[] @relation("PriceChangedBy")
+  recipesCreated            Recipe[]              @relation("RecipeCreatedBy")
+  salesRecorded             Sale[]                @relation("SaleRecordedBy")
+  salesVoided               Sale[]                @relation("SaleVoidedBy")
+  expensesRecorded          Expense[]             @relation("ExpenseRecordedBy")
+  expensesVoided            Expense[]             @relation("ExpenseVoidedBy")
+  purchasesRecorded         StockPurchase[]       @relation("PurchaseRecordedBy")
+  purchasesVoided           StockPurchase[]       @relation("PurchaseVoidedBy")
+  stockMovements            StockMovement[]       @relation("MovementRecordedBy")
+  ownerTransactionsRecorded OwnerTransaction[]    @relation("OwnerTxnRecordedBy")
+  ownerTransactionsVoided   OwnerTransaction[]    @relation("OwnerTxnVoidedBy")
+  openingsCreated           OpeningBalance[]      @relation("OpeningCreatedBy")
+  closingsClosed            DailyClosing[]        @relation("ClosingClosedBy")
+  closingsReopened          DailyClosing[]        @relation("ClosingReopenedBy")
+  notifications             Notification[]
+  auditLogs                 AuditLog[]
+  syncRecords               SyncRecord[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id            String    @id @default(uuid(7)) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  tokenHash     String    @unique @map("token_hash") @db.Char(64)
+  familyId      String    @map("family_id") @db.Uuid
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt     DateTime? @map("revoked_at") @db.Timestamptz(3)
+  revokedReason String?   @map("revoked_reason") @db.VarChar(80)
+  createdByIp   String?   @map("created_by_ip") @db.VarChar(64)
+  userAgent     String?   @map("user_agent") @db.VarChar(500)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, familyId])
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model Restaurant {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  name           String           @db.VarChar(150)
+  phone          String?          @db.VarChar(20)
+  email          String?          @db.VarChar(254)
+  addressLine    String?          @map("address_line") @db.VarChar(255)
+  city           String?          @db.VarChar(100)
+  country        String           @default("MW") @db.Char(2)
+  currency       String           @default("MWK") @db.Char(3)
+  timezone       String           @default("Africa/Blantyre") @db.VarChar(64)
+  logoUrl        String?          @map("logo_url") @db.VarChar(500)
+  openingDate    DateTime?        @map("opening_date") @db.Date
+  operatingHours Json?            @map("operating_hours") @db.JsonB
+  ownerUserId    String?          @map("owner_user_id") @db.Uuid
+  status         RestaurantStatus @default(ACTIVE)
+  closedAt       DateTime?        @map("closed_at") @db.Timestamptz(3)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  owner User? @relation("RestaurantOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+
+  memberships         RestaurantUser[]
+  productCategories   ProductCategory[]
+  products            Product[]
+  suppliers           Supplier[]
+  customers           Customer[]
+  paymentMethods      PaymentMethod[]
+  expenseCategories   ExpenseCategory[]
+  inventoryCategories InventoryCategory[]
+  inventoryItems      InventoryItem[]
+  recipes             Recipe[]
+  sales               Sale[]
+  expenses            Expense[]
+  stockPurchases      StockPurchase[]
+  stockMovements      StockMovement[]
+  dailyClosings       DailyClosing[]
+  ownerTransactions   OwnerTransaction[]
+  openingBalances     OpeningBalance[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  syncRecords         SyncRecord[]
+  documentSequences   DocumentSequence[]
+
+  @@map("restaurants")
+}
+
+model Role {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  key         String   @unique @db.VarChar(50)
+  name        String   @db.VarChar(100)
+  description String?  @db.VarChar(255)
+  isSystem    Boolean  @default(true) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  permissions RolePermission[]
+  memberships RestaurantUser[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  key         String   @unique @db.VarChar(100)
+  module      String   @db.VarChar(50)
+  description String   @db.VarChar(255)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  roles               RolePermission[]
+  membershipOverrides RestaurantUserPermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model RestaurantUser {
+  id                  String           @id @default(uuid(7)) @db.Uuid
+  restaurantId        String           @map("restaurant_id") @db.Uuid
+  userId              String           @map("user_id") @db.Uuid
+  roleId              String           @map("role_id") @db.Uuid
+  status              MembershipStatus @default(ACTIVE)
+  invitedByUserId     String?          @map("invited_by_user_id") @db.Uuid
+  invitedAt           DateTime?        @map("invited_at") @db.Timestamptz(3)
+  acceptedAt          DateTime?        @map("accepted_at") @db.Timestamptz(3)
+  invitationTokenHash String?          @map("invitation_token_hash") @db.Char(64)
+  invitationExpiresAt DateTime?        @map("invitation_expires_at") @db.Timestamptz(3)
+  joinedAt            DateTime         @default(now()) @map("joined_at") @db.Timestamptz(3)
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  user       User       @relation("MembershipUser", fields: [userId], references: [id], onDelete: Cascade)
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  invitedBy  User?      @relation("MembershipInvitedBy", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+
+  permissionOverrides RestaurantUserPermission[]
+
+  @@unique([restaurantId, userId])
+  @@index([userId])
+  @@index([restaurantId, status])
+  @@map("restaurant_users")
+}
+
+model RestaurantUserPermission {
+  restaurantUserId String           @map("restaurant_user_id") @db.Uuid
+  permissionId     String           @map("permission_id") @db.Uuid
+  effect           PermissionEffect
+
+  restaurantUser RestaurantUser @relation(fields: [restaurantUserId], references: [id], onDelete: Cascade)
+  permission     Permission     @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([restaurantUserId, permissionId])
+  @@map("restaurant_user_permissions")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model ProductCategory {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  restaurantId String   @map("restaurant_id") @db.Uuid
+  name         String   @db.VarChar(100)
+  sortOrder    Int      @default(0) @map("sort_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  products   Product[]
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId, isActive])
+  @@map("product_categories")
+}
+
+model Product {
+  id                String        @id @default(uuid(7)) @db.Uuid
+  restaurantId      String        @map("restaurant_id") @db.Uuid
+  categoryId        String        @map("category_id") @db.Uuid
+  name              String        @db.VarChar(150)
+  description       String?       @db.VarChar(500)
+  sellingPriceMinor BigInt        @map("selling_price_minor")
+  currency          String        @default("MWK") @db.Char(3)
+  status            ProductStatus @default(ACTIVE)
+  isRecipeBased     Boolean       @default(false) @map("is_recipe_based")
+  createdByUserId   String        @map("created_by_user_id") @db.Uuid
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant      @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  category   ProductCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  createdBy  User            @relation("ProductCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  recipes      Recipe[]
+  saleItems    SaleItem[]
+  priceHistory ProductPriceHistory[]
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId, status, categoryId])
+  @@map("products")
+}
+
+model ProductPriceHistory {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  productId       String   @map("product_id") @db.Uuid
+  oldPriceMinor   BigInt   @map("old_price_minor")
+  newPriceMinor   BigInt   @map("new_price_minor")
+  changedByUserId String   @map("changed_by_user_id") @db.Uuid
+  changedAt       DateTime @default(now()) @map("changed_at") @db.Timestamptz(3)
+
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  changedBy User    @relation("PriceChangedBy", fields: [changedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([productId, changedAt])
+  @@map("product_price_history")
+}
+
+model Supplier {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  restaurantId String   @map("restaurant_id") @db.Uuid
+  name         String   @db.VarChar(150)
+  phone        String?  @db.VarChar(20)
+  email        String?  @db.VarChar(254)
+  address      String?  @db.VarChar(255)
+  notes        String?  @db.VarChar(500)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant     Restaurant      @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  inventoryItems InventoryItem[]
+  stockPurchases StockPurchase[]
+  expenses       Expense[]
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId, isActive])
+  @@map("suppliers")
+}
+
+model Customer {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  restaurantId String   @map("restaurant_id") @db.Uuid
+  name         String   @db.VarChar(150)
+  phone        String?  @db.VarChar(20)
+  email        String?  @db.VarChar(254)
+  notes        String?  @db.VarChar(500)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  sales      Sale[]
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId, isActive])
+  @@map("customers")
+}
+
+model PaymentMethod {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  restaurantId String?  @map("restaurant_id") @db.Uuid
+  key          String   @db.VarChar(30)
+  name         String   @db.VarChar(80)
+  sortOrder    Int      @default(0) @map("sort_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  restaurant Restaurant? @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  salePayments   SalePayment[]
+  expenses       Expense[]
+  stockPurchases StockPurchase[]
+
+  @@unique([restaurantId, key])
+  @@index([restaurantId, isActive])
+  @@map("payment_methods")
+}
+
+model ExpenseCategory {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  restaurantId String?  @map("restaurant_id") @db.Uuid
+  key          String?  @db.VarChar(50)
+  name         String   @db.VarChar(100)
+  isOperating  Boolean  @default(true) @map("is_operating")
+  isSystem     Boolean  @default(false) @map("is_system")
+  sortOrder    Int      @default(0) @map("sort_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  restaurant Restaurant? @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  expenseItems ExpenseItem[]
+
+  @@unique([restaurantId, key])
+  @@index([restaurantId, isActive])
+  @@map("expense_categories")
+}
+
+model InventoryCategory {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  restaurantId String   @map("restaurant_id") @db.Uuid
+  name         String   @db.VarChar(100)
+  sortOrder    Int      @default(0) @map("sort_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant      @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  items      InventoryItem[]
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId, isActive])
+  @@map("inventory_categories")
+}
+
+// ---------------------------------------------------------------------------
+// Sales
+// ---------------------------------------------------------------------------
+
+model Sale {
+  id                String     @id @default(uuid(7)) @db.Uuid
+  restaurantId      String     @map("restaurant_id") @db.Uuid
+  transactionNumber String     @map("transaction_number") @db.VarChar(30)
+  source            SaleSource
+  status            SaleStatus @default(COMPLETED)
+  occurredAt        DateTime   @map("occurred_at") @db.Timestamptz(3)
+  businessDate      DateTime   @map("business_date") @db.Date
+  currency          String     @default("MWK") @db.Char(3)
+  subtotalMinor     BigInt     @map("subtotal_minor")
+  totalMinor        BigInt     @map("total_minor")
+  notes             String?    @db.VarChar(500)
+  customerId        String?    @map("customer_id") @db.Uuid
+  recordedByUserId  String     @map("recorded_by_user_id") @db.Uuid
+  deviceId          String?    @map("device_id") @db.Uuid
+  clientId          String?    @map("client_id") @db.Uuid
+  voidedAt          DateTime?  @map("voided_at") @db.Timestamptz(3)
+  voidedByUserId    String?    @map("voided_by_user_id") @db.Uuid
+  voidReason        String?    @map("void_reason") @db.VarChar(255)
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  customer   Customer?  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  recordedBy User       @relation("SaleRecordedBy", fields: [recordedByUserId], references: [id], onDelete: Restrict)
+  voidedBy   User?      @relation("SaleVoidedBy", fields: [voidedByUserId], references: [id], onDelete: SetNull)
+  device     Device?    @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  items    SaleItem[]
+  payments SalePayment[]
+
+  @@unique([restaurantId, transactionNumber])
+  @@unique([restaurantId, clientId])
+  @@index([restaurantId, businessDate, status])
+  @@index([restaurantId, source, businessDate])
+  @@index([recordedByUserId])
+  @@map("sales")
+}
+
+model SaleItem {
+  id               String  @id @default(uuid(7)) @db.Uuid
+  saleId           String  @map("sale_id") @db.Uuid
+  productId        String? @map("product_id") @db.Uuid
+  productName      String  @map("product_name") @db.VarChar(150)
+  quantity         Decimal @db.Decimal(18, 4)
+  unitPriceMinor   BigInt  @map("unit_price_minor")
+  lineTotalMinor   BigInt  @map("line_total_minor")
+  costOfGoodsMinor BigInt? @map("cost_of_goods_minor")
+  recipeId         String? @map("recipe_id") @db.Uuid
+  notes            String? @db.VarChar(255)
+
+  sale    Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  recipe  Recipe?  @relation(fields: [recipeId], references: [id], onDelete: SetNull)
+
+  @@index([saleId])
+  @@index([productId])
+  @@map("sale_items")
+}
+
+model SalePayment {
+  id              String @id @default(uuid(7)) @db.Uuid
+  saleId          String @map("sale_id") @db.Uuid
+  paymentMethodId String @map("payment_method_id") @db.Uuid
+  amountMinor     BigInt @map("amount_minor")
+
+  sale          Sale          @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+
+  @@index([saleId])
+  @@index([paymentMethodId])
+  @@map("sale_payments")
+}
+
+model DocumentSequence {
+  id           String       @id @default(uuid(7)) @db.Uuid
+  restaurantId String       @map("restaurant_id") @db.Uuid
+  documentType DocumentType @map("document_type")
+  periodKey    String       @map("period_key") @db.VarChar(8)
+  lastNumber   BigInt       @default(0) @map("last_number")
+  updatedAt    DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@unique([restaurantId, documentType, periodKey])
+  @@map("document_sequences")
+}
+
+// ---------------------------------------------------------------------------
+// Expenses and stock purchases
+// ---------------------------------------------------------------------------
+
+model Expense {
+  id               String        @id @default(uuid(7)) @db.Uuid
+  restaurantId     String        @map("restaurant_id") @db.Uuid
+  expenseNumber    String        @map("expense_number") @db.VarChar(30)
+  status           ExpenseStatus @default(ACTIVE)
+  occurredAt       DateTime      @map("occurred_at") @db.Timestamptz(3)
+  businessDate     DateTime      @map("business_date") @db.Date
+  currency         String        @default("MWK") @db.Char(3)
+  supplierId       String?       @map("supplier_id") @db.Uuid
+  paymentMethodId  String        @map("payment_method_id") @db.Uuid
+  totalMinor       BigInt        @map("total_minor")
+  notes            String?       @db.VarChar(500)
+  recordedByUserId String        @map("recorded_by_user_id") @db.Uuid
+  deviceId         String?       @map("device_id") @db.Uuid
+  clientId         String?       @map("client_id") @db.Uuid
+  voidedAt         DateTime?     @map("voided_at") @db.Timestamptz(3)
+  voidedByUserId   String?       @map("voided_by_user_id") @db.Uuid
+  voidReason       String?       @map("void_reason") @db.VarChar(255)
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant    Restaurant    @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  supplier      Supplier?     @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  recordedBy    User          @relation("ExpenseRecordedBy", fields: [recordedByUserId], references: [id], onDelete: Restrict)
+  voidedBy      User?         @relation("ExpenseVoidedBy", fields: [voidedByUserId], references: [id], onDelete: SetNull)
+  device        Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  items ExpenseItem[]
+
+  @@unique([restaurantId, expenseNumber])
+  @@unique([restaurantId, clientId])
+  @@index([restaurantId, businessDate, status])
+  @@index([recordedByUserId])
+  @@map("expenses")
+}
+
+model ExpenseItem {
+  id                String  @id @default(uuid(7)) @db.Uuid
+  expenseId         String  @map("expense_id") @db.Uuid
+  expenseCategoryId String  @map("expense_category_id") @db.Uuid
+  description       String  @db.VarChar(200)
+  quantity          Decimal @db.Decimal(18, 4)
+  unit              String  @db.VarChar(20)
+  unitPriceMinor    BigInt  @map("unit_price_minor")
+  lineTotalMinor    BigInt  @map("line_total_minor")
+
+  expense  Expense         @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  category ExpenseCategory @relation(fields: [expenseCategoryId], references: [id], onDelete: Restrict)
+
+  @@index([expenseId])
+  @@index([expenseCategoryId])
+  @@map("expense_items")
+}
+
+model StockPurchase {
+  id               String              @id @default(uuid(7)) @db.Uuid
+  restaurantId     String              @map("restaurant_id") @db.Uuid
+  purchaseNumber   String              @map("purchase_number") @db.VarChar(30)
+  status           StockPurchaseStatus @default(RECEIVED)
+  supplierId       String?             @map("supplier_id") @db.Uuid
+  paymentMethodId  String              @map("payment_method_id") @db.Uuid
+  occurredAt       DateTime            @map("occurred_at") @db.Timestamptz(3)
+  businessDate     DateTime            @map("business_date") @db.Date
+  currency         String              @default("MWK") @db.Char(3)
+  totalMinor       BigInt              @map("total_minor")
+  notes            String?             @db.VarChar(500)
+  recordedByUserId String              @map("recorded_by_user_id") @db.Uuid
+  deviceId         String?             @map("device_id") @db.Uuid
+  clientId         String?             @map("client_id") @db.Uuid
+  voidedAt         DateTime?           @map("voided_at") @db.Timestamptz(3)
+  voidedByUserId   String?             @map("voided_by_user_id") @db.Uuid
+  voidReason       String?             @map("void_reason") @db.VarChar(255)
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant    Restaurant    @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  supplier      Supplier?     @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  recordedBy    User          @relation("PurchaseRecordedBy", fields: [recordedByUserId], references: [id], onDelete: Restrict)
+  voidedBy      User?         @relation("PurchaseVoidedBy", fields: [voidedByUserId], references: [id], onDelete: SetNull)
+  device        Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  items StockPurchaseItem[]
+
+  @@unique([restaurantId, purchaseNumber])
+  @@unique([restaurantId, clientId])
+  @@index([restaurantId, businessDate, status])
+  @@index([recordedByUserId])
+  @@map("stock_purchases")
+}
+
+model StockPurchaseItem {
+  id              String  @id @default(uuid(7)) @db.Uuid
+  stockPurchaseId String  @map("stock_purchase_id") @db.Uuid
+  inventoryItemId String  @map("inventory_item_id") @db.Uuid
+  quantity        Decimal @db.Decimal(18, 4)
+  unit            String  @db.VarChar(20)
+  unitPriceMinor  BigInt  @map("unit_price_minor")
+  lineTotalMinor  BigInt  @map("line_total_minor")
+
+  stockPurchase StockPurchase @relation(fields: [stockPurchaseId], references: [id], onDelete: Cascade)
+  inventoryItem InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Restrict)
+
+  @@index([stockPurchaseId])
+  @@index([inventoryItemId])
+  @@map("stock_purchase_items")
+}
+
+model InventoryItem {
+  id                      String    @id @default(uuid(7)) @db.Uuid
+  restaurantId            String    @map("restaurant_id") @db.Uuid
+  categoryId              String    @map("category_id") @db.Uuid
+  name                    String    @db.VarChar(150)
+  unit                    String    @db.VarChar(20)
+  currentQuantity         Decimal   @default(0) @map("current_quantity") @db.Decimal(18, 4)
+  minimumLevel            Decimal   @default(0) @map("minimum_level") @db.Decimal(18, 4)
+  averageCostMinorPerUnit Decimal   @default(0) @map("average_cost_minor_per_unit") @db.Decimal(18, 6)
+  defaultSupplierId       String?   @map("default_supplier_id") @db.Uuid
+  lastRestockedAt         DateTime? @map("last_restocked_at") @db.Timestamptz(3)
+  isActive                Boolean   @default(true) @map("is_active")
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant      Restaurant        @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  category        InventoryCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  defaultSupplier Supplier?         @relation(fields: [defaultSupplierId], references: [id], onDelete: SetNull)
+
+  stockPurchaseItems StockPurchaseItem[]
+  stockMovements     StockMovement[]
+  recipeIngredients  RecipeIngredient[]
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId, isActive])
+  @@map("inventory_items")
+}
+
+model StockMovement {
+  id               String             @id @default(uuid(7)) @db.Uuid
+  restaurantId     String             @map("restaurant_id") @db.Uuid
+  inventoryItemId  String             @map("inventory_item_id") @db.Uuid
+  type             StockMovementType
+  quantityDelta    Decimal            @map("quantity_delta") @db.Decimal(18, 4)
+  unitCostMinor    Decimal            @map("unit_cost_minor") @db.Decimal(18, 6)
+  valueMinor       BigInt             @map("value_minor")
+  quantityAfter    Decimal            @map("quantity_after") @db.Decimal(18, 4)
+  referenceType    StockReferenceType @map("reference_type")
+  referenceId      String?            @map("reference_id") @db.Uuid
+  reason           String?            @db.VarChar(255)
+  occurredAt       DateTime           @map("occurred_at") @db.Timestamptz(3)
+  businessDate     DateTime           @map("business_date") @db.Date
+  recordedByUserId String             @map("recorded_by_user_id") @db.Uuid
+  createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  restaurant    Restaurant    @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  inventoryItem InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Restrict)
+  recordedBy    User          @relation("MovementRecordedBy", fields: [recordedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([inventoryItemId, occurredAt])
+  @@index([restaurantId, businessDate, type])
+  @@index([referenceType, referenceId])
+  @@map("stock_movements")
+}
+
+// ---------------------------------------------------------------------------
+// Recipes
+// ---------------------------------------------------------------------------
+
+model Recipe {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  restaurantId    String   @map("restaurant_id") @db.Uuid
+  productId       String   @map("product_id") @db.Uuid
+  version         Int      @default(1)
+  yieldQuantity   Decimal  @default(1) @map("yield_quantity") @db.Decimal(18, 4)
+  isActive        Boolean  @default(true) @map("is_active")
+  notes           String?  @db.VarChar(500)
+  createdByUserId String   @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  product    Product    @relation(fields: [productId], references: [id], onDelete: Restrict)
+  createdBy  User       @relation("RecipeCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  ingredients RecipeIngredient[]
+  saleItems   SaleItem[]
+
+  @@unique([productId, version])
+  @@index([restaurantId, isActive])
+  @@map("recipes")
+}
+
+model RecipeIngredient {
+  id              String  @id @default(uuid(7)) @db.Uuid
+  recipeId        String  @map("recipe_id") @db.Uuid
+  inventoryItemId String  @map("inventory_item_id") @db.Uuid
+  quantity        Decimal @db.Decimal(18, 4)
+  unit            String  @db.VarChar(20)
+
+  recipe        Recipe        @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  inventoryItem InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Restrict)
+
+  @@unique([recipeId, inventoryItemId])
+  @@index([inventoryItemId])
+  @@map("recipe_ingredients")
+}
+
+// ---------------------------------------------------------------------------
+// Finance and control
+// ---------------------------------------------------------------------------
+
+model DailyClosing {
+  id                     String             @id @default(uuid(7)) @db.Uuid
+  restaurantId           String             @map("restaurant_id") @db.Uuid
+  businessDate           DateTime           @map("business_date") @db.Date
+  status                 DailyClosingStatus @default(OPEN)
+  cashSalesMinor         BigInt             @default(0) @map("cash_sales_minor")
+  mobileMoneySalesMinor  BigInt             @default(0) @map("mobile_money_sales_minor")
+  bankSalesMinor         BigInt             @default(0) @map("bank_sales_minor")
+  otherSalesMinor        BigInt             @default(0) @map("other_sales_minor")
+  manualSalesMinor       BigInt             @default(0) @map("manual_sales_minor")
+  totalSalesMinor        BigInt             @default(0) @map("total_sales_minor")
+  cogsMinor              BigInt             @default(0) @map("cogs_minor")
+  grossProfitMinor       BigInt             @default(0) @map("gross_profit_minor")
+  operatingExpensesMinor BigInt             @default(0) @map("operating_expenses_minor")
+  netProfitMinor         BigInt             @default(0) @map("net_profit_minor")
+  transactionCount       Int                @default(0) @map("transaction_count")
+  closedByUserId         String             @map("closed_by_user_id") @db.Uuid
+  closedAt               DateTime           @map("closed_at") @db.Timestamptz(3)
+  reopenedByUserId       String?            @map("reopened_by_user_id") @db.Uuid
+  reopenedAt             DateTime?          @map("reopened_at") @db.Timestamptz(3)
+  reopenReason           String?            @map("reopen_reason") @db.VarChar(255)
+  createdAt              DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  closedBy   User       @relation("ClosingClosedBy", fields: [closedByUserId], references: [id], onDelete: Restrict)
+  reopenedBy User?      @relation("ClosingReopenedBy", fields: [reopenedByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([restaurantId, businessDate])
+  @@index([restaurantId, status])
+  @@map("daily_closings")
+}
+
+model OwnerTransaction {
+  id               String                 @id @default(uuid(7)) @db.Uuid
+  restaurantId     String                 @map("restaurant_id") @db.Uuid
+  type             OwnerTransactionType
+  status           OwnerTransactionStatus @default(ACTIVE)
+  amountMinor      BigInt                 @map("amount_minor")
+  occurredAt       DateTime               @map("occurred_at") @db.Timestamptz(3)
+  businessDate     DateTime               @map("business_date") @db.Date
+  currency         String                 @default("MWK") @db.Char(3)
+  description      String                 @db.VarChar(255)
+  recordedByUserId String                 @map("recorded_by_user_id") @db.Uuid
+  clientId         String?                @map("client_id") @db.Uuid
+  voidedAt         DateTime?              @map("voided_at") @db.Timestamptz(3)
+  voidedByUserId   String?                @map("voided_by_user_id") @db.Uuid
+  voidReason       String?                @map("void_reason") @db.VarChar(255)
+  createdAt        DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  recordedBy User       @relation("OwnerTxnRecordedBy", fields: [recordedByUserId], references: [id], onDelete: Restrict)
+  voidedBy   User?      @relation("OwnerTxnVoidedBy", fields: [voidedByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([restaurantId, clientId])
+  @@index([restaurantId, businessDate, type, status])
+  @@map("owner_transactions")
+}
+
+model OpeningBalance {
+  id                  String   @id @default(uuid(7)) @db.Uuid
+  restaurantId        String   @map("restaurant_id") @db.Uuid
+  asOfDate            DateTime @map("as_of_date") @db.Date
+  cashMinor           BigInt   @default(0) @map("cash_minor")
+  bankMinor           BigInt   @default(0) @map("bank_minor")
+  inventoryValueMinor BigInt   @default(0) @map("inventory_value_minor")
+  notes               String?  @db.VarChar(255)
+  createdByUserId     String   @map("created_by_user_id") @db.Uuid
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  createdBy  User       @relation("OpeningCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([restaurantId, asOfDate])
+  @@map("opening_balances")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  restaurantId String?  @map("restaurant_id") @db.Uuid
+  actorUserId  String?  @map("actor_user_id") @db.Uuid
+  action       String   @db.VarChar(80)
+  entityType   String   @map("entity_type") @db.VarChar(50)
+  entityId     String?  @map("entity_id") @db.Uuid
+  before       Json?    @db.JsonB
+  after        Json?    @db.JsonB
+  ip           String?  @db.VarChar(64)
+  userAgent    String?  @map("user_agent") @db.VarChar(500)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  restaurant Restaurant? @relation(fields: [restaurantId], references: [id], onDelete: SetNull)
+  actor      User?       @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([restaurantId, createdAt])
+  @@index([entityType, entityId])
+  @@index([actorUserId, createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications and synchronization
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id           String               @id @default(uuid(7)) @db.Uuid
+  restaurantId String               @map("restaurant_id") @db.Uuid
+  userId       String               @map("user_id") @db.Uuid
+  type         NotificationType
+  severity     NotificationSeverity @default(INFO)
+  titleKey     String               @map("title_key") @db.VarChar(120)
+  bodyKey      String               @map("body_key") @db.VarChar(120)
+  params       Json?                @db.JsonB
+  dedupeKey    String?              @map("dedupe_key") @db.VarChar(200)
+  readAt       DateTime?            @map("read_at") @db.Timestamptz(3)
+  createdAt    DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, readAt, createdAt])
+  @@map("notifications")
+}
+
+model Device {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  platform   String   @db.VarChar(20)
+  name       String   @db.VarChar(100)
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sales          Sale[]
+  expenses       Expense[]
+  stockPurchases StockPurchase[]
+  syncRecords    SyncRecord[]
+
+  @@index([userId, lastSeenAt])
+  @@map("devices")
+}
+
+model SyncRecord {
+  id            String        @id @default(uuid(7)) @db.Uuid
+  restaurantId  String        @map("restaurant_id") @db.Uuid
+  deviceId      String        @map("device_id") @db.Uuid
+  userId        String        @map("user_id") @db.Uuid
+  entityType    String        @map("entity_type") @db.VarChar(50)
+  entityId      String?       @map("entity_id") @db.Uuid
+  clientId      String?       @map("client_id") @db.Uuid
+  direction     SyncDirection
+  status        SyncStatus    @default(PENDING)
+  attempts      Int           @default(0)
+  lastError     String?       @map("last_error") @db.VarChar(500)
+  lastAttemptAt DateTime?     @map("last_attempt_at") @db.Timestamptz(3)
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  device     Device     @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId, deviceId, status])
+  @@index([clientId])
+  @@map("sync_records")
+}

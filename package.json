@@ -1,0 +1,27 @@
+{
+  "name": "restaurant-business-manager",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace @rbm/api",
+    "build": "npm run build:shared && npm run build:api",
+    "build:api": "npm run build --workspace @rbm/api",
+    "build:shared": "npm run build --workspace @rbm/shared",
+    "typecheck": "npm run build:shared && npm run typecheck:shared && npm run typecheck:api && npm run typecheck:mobile",
+    "typecheck:api": "npm run typecheck --workspace @rbm/api",
+    "typecheck:mobile": "npm run typecheck --workspace @rbm/mobile",
+    "typecheck:shared": "npm run typecheck --workspace @rbm/shared",
+    "test:api": "npm run test --workspace @rbm/api",
+    "prisma:generate": "npm run prisma:generate --workspace @rbm/api",
+    "prisma:migrate": "npm run prisma:migrate --workspace @rbm/api",
+    "prisma:deploy": "npm run prisma:deploy --workspace @rbm/api",
+    "prisma:seed": "npm run prisma:seed --workspace @rbm/api"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}
