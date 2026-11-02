@@ -1,60 +1,74 @@
-import { Prisma } from "@prisma/client";
-import { recordAudit } from "../../lib/audit.js";
-import { businessDateFrom, dateOnlyToDate, dateToDateOnly } from "../../lib/business-date.js";
-import { assertDayOpen } from "../../lib/day-lock.js";
-import { decimal } from "../../lib/decimal.js";
+import { pool, query, transaction } from "../../lib/db.js";
 import { BadRequestError, NotFoundError } from "../../lib/errors.js";
-import { prisma } from "../../lib/prisma.js";
+import { toBigInt, decimal as decDecimal, roundTo } from "../../lib/decimal.js";
 import { nextDocumentNumber } from "../../lib/sequence.js";
 import { lineTotalMinor } from "@rbm/shared";
 
 type AuditMeta = { ip?: string; userAgent?: string };
 
-const expenseInclude = {
-  items: { include: { category: { select: { id: true, name: true, key: true } } } },
-  supplier: { select: { id: true, name: true } },
-  paymentMethod: { select: { id: true, key: true, name: true } },
-  recordedBy: { select: { id: true, fullName: true } }
-} satisfies Prisma.ExpenseInclude;
+// SQL Queries (parameterized to prevent SQL injection)
+const EXPENSES_BY_RESTAURANT = `
+  SELECT e.*, c.name as category_name, c.key as category_key,
+         sm.name as supplier_name, pm.name as payment_method_name
+  FROM expenses e
+  LEFT JOIN expense_categories c ON e.expense_category_id = c.id
+  LEFT JOIN suppliers sm ON e.supplier_id = sm.id
+  LEFT JOIN payment_methods pm ON e.payment_method_id = pm.id
+  WHERE e.restaurant_id = $1
+`;
 
-type ExpenseRecord = Prisma.ExpenseGetPayload<{ include: typeof expenseInclude }>;
+const EXPENSE_BY_ID = `
+  SELECT * FROM expenses WHERE id = $1
+`;
 
-function serializeExpense(expense: ExpenseRecord) {
+const CREATE_EXPENSE = `
+  INSERT INTO expenses (restaurant_id, expense_number, occurred_at, business_date,
+                       currency, supplier_id, payment_method_id, total_minor, notes,
+                       recorded_by_user_id, client_id)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  RETURNING *
+`;
+
+const GET_PAYMENT_METHOD = `
+  SELECT id, key, name FROM payment_method WHERE id = $1 AND (restaurant_id IS NULL OR restaurant_id = $2)
+`;
+
+const GET_EXPENSE_CATEGORY_BY_ID = `
+  SELECT id, key, name, is_operating FROM expense_category WHERE id = $1 AND (restaurant_id IS NULL OR restaurant_id = $2)
+`;
+
+const GET_ALL_EXPENSE_CATEGORIES = `
+  SELECT id, key, name, is_operating, is_system FROM expense_category WHERE is_active = true AND (restaurant_id IS NULL OR restaurant_id = $1)
+  ORDER BY sort_order, name
+`;
+
+function serializeExpense(expense: any) {
   return {
     id: expense.id,
-    expenseNumber: expense.expenseNumber,
+    expenseNumber: expense.expense_number,
     status: expense.status,
-    occurredAt: expense.occurredAt.toISOString(),
-    businessDate: dateToDateOnly(expense.businessDate),
-    currency: expense.currency,
-    totalMinor: expense.totalMinor.toString(),
+    occurredAt: expense.occurredAt?.toISOString() || new Date().toISOString(),
+    businessDate: expense.business_date?.toString() || new Date().toISOString().split('T')[0],
+    currency: expense.currency || "MWK",
+    totalMinor: toBigInt(expense.total_minor),
     notes: expense.notes,
     supplier: expense.supplier,
-    paymentMethod: expense.paymentMethod,
-    recordedBy: expense.recordedBy,
-    voidedAt: expense.voidedAt?.toISOString() ?? null,
-    voidReason: expense.voidReason,
-    items: expense.items.map((item) => ({
+    paymentMethod: expense.payment_method,
+    recordedBy: expense.recorded_by_user_id,
+    voidedAt: expense.voidedAt?.toISOString() || null,
+    voidReason: expense.void_reason,
+    items: (expense.items || []).map((item: any) => ({
       id: item.id,
-      categoryId: item.expenseCategoryId,
-      categoryName: item.category.name,
-      categoryKey: item.category.key,
+      categoryId: item.expense_category_id,
+      categoryName: item.category?.name || "",
+      categoryKey: item.category?.key || "",
       description: item.description,
       quantity: item.quantity.toFixed(4),
       unit: item.unit,
-      unitPriceMinor: item.unitPriceMinor.toString(),
-      lineTotalMinor: item.lineTotalMinor.toString()
+      unitPriceMinor: toBigInt(item.unit_price_minor),
+      lineTotalMinor: toBigInt(item.line_total_minor)
     }))
   };
-}
-
-async function loadExpense(restaurantId: string, expenseId: string) {
-  const expense = await prisma.expense.findFirst({
-    where: { id: expenseId, restaurantId },
-    include: expenseInclude
-  });
-  if (!expense) throw new NotFoundError("The expense was not found");
-  return serializeExpense(expense);
 }
 
 export async function listExpenses(
@@ -69,34 +83,57 @@ export async function listExpenses(
     supplierId?: string;
   }
 ) {
-  const where: Prisma.ExpenseWhereInput = {
-    restaurantId,
-    ...(query.status ? { status: query.status } : {}),
-    ...(query.supplierId ? { supplierId: query.supplierId } : {}),
-    ...(query.categoryId ? { items: { some: { expenseCategoryId: query.categoryId } } } : {}),
-    ...(query.startDate || query.endDate
-      ? {
-          businessDate: {
-            ...(query.startDate ? { gte: dateOnlyToDate(query.startDate) } : {}),
-            ...(query.endDate ? { lte: dateOnlyToDate(query.endDate) } : {})
-          }
-        }
-      : {})
-  };
+  const params: any[] = [restaurantId];
+  let whereClause = "WHERE e.restaurant_id = $1";
+  let paramIndex = 2;
 
-  const [expenses, total] = await Promise.all([
-    prisma.expense.findMany({
-      where,
-      orderBy: [{ occurredAt: "desc" }],
-      skip: (query.page - 1) * query.pageSize,
-      take: query.pageSize,
-      include: expenseInclude
-    }),
-    prisma.expense.count({ where })
-  ]);
+  if (query.status) {
+    whereClause += ` AND e.status = $${paramIndex}`;
+    params.push(query.status);
+    paramIndex++;
+  }
+
+  if (query.categoryId) {
+    whereClause += ` AND e.expense_category_id = $${paramIndex}`;
+    params.push(query.categoryId);
+    paramIndex++;
+  }
+
+  if (query.supplierId) {
+    whereClause += ` AND e.supplier_id = $${paramIndex}`;
+    params.push(query.supplierId);
+    paramIndex++;
+  }
+
+  if (query.startDate || query.endDate) {
+    whereClause += ` AND e.occurred_at >= $${paramIndex}`;
+    params.push(query.startDate || "1900-01-01");
+    paramIndex++;
+    if (query.endDate) {
+      whereClause += ` AND e.occurred_at <= $${paramIndex}`;
+      params.push(query.endDate);
+      paramIndex++;
+    }
+  }
+
+  // Count total
+  const [{ count }] = await pool.query(
+    `SELECT COUNT(*)::int as total FROM expenses ${whereClause}`,
+    params
+  );
+  const total = count || 0;
+
+  // Add pagination params
+  params.push(query.pageSize, (query.page - 1) * query.pageSize);
+
+  // Fetch page
+  const { rows } = await pool.query(
+    `SELECT * FROM expenses ${whereClause} ORDER BY occurred_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+    params
+  );
 
   return {
-    items: expenses.map(serializeExpense),
+    items: rows.map(serializeExpense),
     total,
     page: query.page,
     pageSize: query.pageSize
@@ -104,7 +141,10 @@ export async function listExpenses(
 }
 
 export async function getExpense(restaurantId: string, expenseId: string) {
-  return loadExpense(restaurantId, expenseId);
+  const { rows } = await pool.query(EXPENSE_BY_ID, [expenseId]);
+
+  if (rows.length === 0) throw new NotFoundError("The expense was not found");
+  return serializeExpense(rows[0]);
 }
 
 export async function createExpense(
@@ -126,115 +166,89 @@ export async function createExpense(
   },
   meta: AuditMeta
 ) {
-  if (input.clientId) {
-    const existing = await prisma.expense.findFirst({
-      where: { restaurantId, clientId: input.clientId },
-      include: expenseInclude
-    });
-    if (existing) return serializeExpense(existing);
-  }
+  const result = await transaction(async (client) => {
+    // 1. Validate restaurant
+    const { rows: restaurant } = await client.query(
+      `SELECT id, currency FROM restaurants WHERE id = $1`,
+      [restaurantId]
+    );
+    if (restaurant.length === 0) throw new NotFoundError("Restaurant not found");
 
-  const occurredAt = new Date(input.occurredAt);
-  const restaurant = await prisma.restaurant.findUniqueOrThrow({
-    where: { id: restaurantId },
-    select: { timezone: true, currency: true }
-  });
-  const businessDate = businessDateFrom(occurredAt, restaurant.timezone);
+    // 2. Validate payment method
+    const { rows: method } = await client.query(
+      GET_PAYMENT_METHOD,
+      [input.paymentMethodId, restaurantId]
+    );
+    if (method.length === 0) throw new NotFoundError("Payment method not found");
 
-  const expenseId = await prisma.$transaction(
-    async (transaction) => {
-      await assertDayOpen(transaction, restaurantId, businessDate);
+    // 3. Validate categories
+    const categoryIds = [...new Set(input.items.map((item) => item.categoryId))];
+    const { rows: categories } = await client.query(
+      `SELECT id, key, name, is_operating FROM expense_category WHERE id = ANY($1::int[]) AND is_active = true`,
+      [categoryIds]
+    );
+    const validCategoryIds = new Set(categories.map((c: any) => c.id));
+    const allCategoriesValid = categoryIds.every(id => validCategoryIds.has(id));
+    if (!allCategoriesValid) throw new NotFoundError("An expense category was not found");
 
-      const method = await transaction.paymentMethod.findFirst({
-        where: {
-          id: input.paymentMethodId,
-          isActive: true,
-          OR: [{ restaurantId }, { restaurantId: null }]
-        },
-        select: { id: true }
-      });
-      if (!method) throw new NotFoundError("The payment method was not found");
+    // 4. Calculate totals
+    const lines = input.items.map((item) => ({
+      ...item,
+      lineTotalMinor: lineTotalMinor(item.quantity, item.unitPriceMinor)
+    }));
+    const total = lines.reduce((sum, item) => sum + toBigInt(item.lineTotalMinor), 0n);
+    if (total <= 0n) throw new BadRequestError("The expense total must be greater than zero");
 
-      if (input.supplierId) {
-        const supplier = await transaction.supplier.findFirst({
-          where: { id: input.supplierId, restaurantId },
-          select: { id: true }
-        });
-        if (!supplier) throw new NotFoundError("The supplier was not found");
-      }
+    // 5. Generate expense number
+    const expenseNumber = await nextDocumentNumber(client, restaurantId, "EXPENSE");
 
-      const categoryIds = [...new Set(input.items.map((item) => item.categoryId))];
-      const categories = await transaction.expenseCategory.findMany({
-        where: {
-          id: { in: categoryIds },
-          isActive: true,
-          OR: [{ restaurantId }, { restaurantId: null }]
-        },
-        select: { id: true }
-      });
-      if (categories.length !== categoryIds.length) {
-        throw new NotFoundError("An expense category was not found");
-      }
+    // 6. Insert expense
+    const { rows: expense } = await client.query(CREATE_EXPENSE, [
+      restaurantId,
+      expenseNumber,
+      new Date(input.occurredAt),
+      /* business date */ new Date(),
+      "MWK",
+      input.supplierId,
+      input.paymentMethodId,
+      total,
+      input.notes,
+      actorUserId,
+      input.clientId
+    ]);
 
-      const lines = input.items.map((item) => ({
-        ...item,
-        lineTotalMinor: lineTotalMinor(item.quantity, item.unitPriceMinor)
-      }));
-      const total = lines.reduce((sum, item) => sum + item.lineTotalMinor, 0n);
-      if (total <= 0n) {
-        throw new BadRequestError("The expense total must be greater than zero");
-      }
-
-      const expenseNumber = await nextDocumentNumber(
-        transaction,
-        restaurantId,
-        "EXPENSE",
-        businessDate
+    // 7. Insert expense items
+    for (const item of lines) {
+      await client.query(
+        `INSERT INTO expense_items (expense_id, expense_category_id, description, quantity, unit, unit_price_minor, line_total_minor)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          expense.id,
+          item.categoryId,
+          item.description,
+          item.quantity,
+          item.unit,
+          toBigInt(item.unitPriceMinor),
+          toBigInt(item.lineTotalMinor)
+        ]
       );
+    }
 
-      const expense = await transaction.expense.create({
-        data: {
-          restaurantId,
-          expenseNumber,
-          occurredAt,
-          businessDate,
-          currency: restaurant.currency,
-          supplierId: input.supplierId,
-          paymentMethodId: input.paymentMethodId,
-          totalMinor: total,
-          notes: input.notes,
-          recordedByUserId: actorUserId,
-          clientId: input.clientId,
-          items: {
-            create: lines.map((item) => ({
-              expenseCategoryId: item.categoryId,
-              description: item.description,
-              quantity: decimal(item.quantity),
-              unit: item.unit,
-              unitPriceMinor: item.unitPriceMinor,
-              lineTotalMinor: item.lineTotalMinor
-            }))
-          }
-        },
-        select: { id: true }
-      });
+    // 8. Record audit
+    await client.query(
+      `INSERT INTO audit_log (restaurant_id, actor_user_id, action, entity_type, entity_id, before, after, ip, user_agent, created_at)
+       VALUES ($1, $2, 'EXPENSE_CREATED', 'Expense', $3, $4, $5, $6, $7, NOW())`,
+      [restaurantId, actorUserId, expense.id,
+        JSON.stringify({ expenseNumber, totalMinor: total.toString() }),
+        null,
+        JSON.stringify({ expenseNumber, totalMinor: total.toString() }),
+        meta.ip, meta.userAgent]
+    );
 
-      await recordAudit(transaction, {
-        restaurantId,
-        actorUserId,
-        action: "EXPENSE_CREATED",
-        entityType: "Expense",
-        entityId: expense.id,
-        after: { expenseNumber, totalMinor: total.toString() },
-        ...meta
-      });
+    return { success: true, expense: { id: expense.id, ...expense, items: lines } };
+  });
 
-      return expense.id;
-    },
-    { maxWait: 10_000, timeout: 20_000 }
-  );
-
-  return loadExpense(restaurantId, expenseId);
+  return result;
 }
 
 export async function voidExpense(
@@ -244,49 +258,27 @@ export async function voidExpense(
   reason: string,
   meta: AuditMeta
 ) {
-  await prisma.$transaction(async (transaction) => {
-    const expense = await transaction.expense.findFirst({
-      where: { id: expenseId, restaurantId }
-    });
-    if (!expense) throw new NotFoundError("The expense was not found");
-    if (expense.status === "VOIDED") {
-      throw new BadRequestError("This expense is already voided");
-    }
+  const result = await transaction(async (client) => {
+    const { rows: expense } = await pool.query(EXPENSE_BY_ID, [expenseId]);
+    if (expense.length === 0) throw new NotFoundError("The expense was not found");
+    if (expense[0].status === "VOIDED") throw new BadRequestError("This expense is already voided");
 
-    await assertDayOpen(transaction, restaurantId, expense.businessDate);
+    await client.query(
+      `UPDATE expenses SET status = 'VOIDED', voided_at = NOW(), void_reason = $1 WHERE id = $2`,
+      [reason, expenseId]
+    );
 
-    await transaction.expense.update({
-      where: { id: expenseId },
-      data: {
-        status: "VOIDED",
-        voidedAt: new Date(),
-        voidedByUserId: actorUserId,
-        voidReason: reason
-      }
-    });
+    await client.query(
+      `INSERT INTO audit_log (restaurant_id, actor_user_id, action, entity_type, entity_id, before, after, ip, user_agent, created_at)
+       VALUES ($1, $2, 'EXPENSE_VOIDED', 'Expense', $3, $4, $5, $6, $7, NOW())`,
+      [restaurantId, actorUserId, expense.id,
+        JSON.stringify({ status: "ACTIVE", totalMinor: toBigInt(expense[0].total_minor).toString() }),
+        JSON.stringify({ status: "VOIDED", reason }),
+        meta.ip, meta.userAgent]
+    );
 
-    await recordAudit(transaction, {
-      restaurantId,
-      actorUserId,
-      action: "EXPENSE_VOIDED",
-      entityType: "Expense",
-      entityId: expenseId,
-      before: { status: "ACTIVE", totalMinor: expense.totalMinor.toString() },
-      after: { status: "VOIDED", reason },
-      ...meta
-    });
+    return getExpense(restaurantId, expenseId);
   });
 
-  return loadExpense(restaurantId, expenseId);
-}
-
-export async function listExpenseCategories(restaurantId: string) {
-  return prisma.expenseCategory.findMany({
-    where: {
-      isActive: true,
-      OR: [{ restaurantId }, { restaurantId: null }]
-    },
-    orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
-    select: { id: true, key: true, name: true, isOperating: true, isSystem: true }
-  });
+  return result;
 }
