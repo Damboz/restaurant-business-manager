@@ -1,4 +1,4 @@
--- CreateEnum
+﻿-- CreateEnum
 CREATE TYPE "ProductStatus" AS ENUM ('ACTIVE', 'INACTIVE');
 
 -- CreateEnum

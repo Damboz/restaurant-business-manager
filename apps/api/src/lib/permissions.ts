@@ -1,8 +1,8 @@
-import type { PermissionEffect } from "@prisma/client";
+export type PermissionEffect = "ALLOW" | "DENY";
 
 export type PermissionOverride = {
   key: string;
-  effect: PermissionEffect | "ALLOW" | "DENY";
+  effect: PermissionEffect;
 };
 
 /**

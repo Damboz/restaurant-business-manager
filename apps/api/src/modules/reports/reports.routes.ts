@@ -1,4 +1,4 @@
-import { Router, type Request } from "express";
+﻿import { Router, type Request } from "express";
 import { asyncHandler } from "../../lib/async-handler.js";
 import { stringParam } from "../../lib/request-params.js";
 import { requirePermission } from "../../middleware/restaurant.js";
@@ -9,7 +9,8 @@ import {
   summaryForRange
 } from "./reports.service.js";
 import { exportQuerySchema, summaryQuerySchema } from "./reports.schemas.js";
-import { prisma } from "../../lib/prisma.js";
+import { query } from "../../lib/db.js";
+import { NotFoundError } from "../../lib/errors.js";
 import { todayInTimeZone } from "../../lib/business-date.js";
 
 function restaurantIdFrom(request: Request): string {
@@ -31,20 +32,23 @@ reportsRouter.get(
   requirePermission("reports.view"),
   asyncHandler(async (request, response) => {
     const restaurantId = restaurantIdFrom(request);
-    let query;
+    let range;
 
     if (request.query.startDate && request.query.endDate) {
-      query = summaryQuerySchema.parse(request.query);
+      range = summaryQuerySchema.parse(request.query);
     } else {
-      const restaurant = await prisma.restaurant.findUniqueOrThrow({
-        where: { id: restaurantId },
-        select: { timezone: true }
-      });
-      query = defaultReportDates(todayInTimeZone(restaurant.timezone));
+      const { rows } = await query<{ timezone: string }>(
+        "SELECT timezone FROM restaurants WHERE id = $1",
+        [restaurantId]
+      );
+      if (!rows[0]) {
+        throw new NotFoundError("The restaurant was not found");
+      }
+      range = defaultReportDates(todayInTimeZone(rows[0].timezone));
     }
 
     response.json({
-      data: await summaryForRange(restaurantId, query.startDate, query.endDate)
+      data: await summaryForRange(restaurantId, range.startDate, range.endDate)
     });
   })
 );

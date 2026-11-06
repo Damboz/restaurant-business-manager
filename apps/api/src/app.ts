@@ -3,7 +3,7 @@ import express from "express";
 import helmet from "helmet";
 import { env } from "./config/env.js";
 import { asyncHandler } from "./lib/async-handler.js";
-import { prisma } from "./lib/prisma.js";
+import { pool } from "./lib/db.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
 import { authRouter } from "./modules/auth/auth.routes.js";
 import { restaurantsRouter } from "./modules/restaurants/restaurants.routes.js";
@@ -51,7 +51,7 @@ export function createApp(): express.Express {
   app.get(
     "/api/v1/health/ready",
     asyncHandler(async (_request, response) => {
-      await prisma.$queryRaw`SELECT 1`;
+      await pool.query("SELECT 1");
 
       response.json({
         data: {

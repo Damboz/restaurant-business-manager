@@ -1,43 +1,69 @@
-import { prisma } from "../../lib/prisma.js";
+import { query } from "../../lib/db.js";
 import { NotFoundError } from "../../lib/errors.js";
+
+type NotificationRow = {
+  id: string;
+  type: string;
+  severity: string;
+  title_key: string;
+  body_key: string;
+  params: Record<string, unknown> | null;
+  read_at: Date | null;
+  created_at: Date;
+};
 
 export async function listNotifications(
   restaurantId: string,
   userId: string,
-  query: { page: number; pageSize: number; unreadOnly: boolean }
+  queryInput: { page: number; pageSize: number; unreadOnly: boolean }
 ) {
-  const where = {
-    restaurantId,
-    userId,
-    ...(query.unreadOnly ? { readAt: null } : {})
-  };
+  const params: unknown[] = [restaurantId, userId];
+  let where = "WHERE restaurant_id = $1 AND user_id = $2";
 
-  const [items, total, unread] = await Promise.all([
-    prisma.notification.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      skip: (query.page - 1) * query.pageSize,
-      take: query.pageSize
-    }),
-    prisma.notification.count({ where }),
-    prisma.notification.count({ where: { restaurantId, userId, readAt: null } })
+  if (queryInput.unreadOnly) {
+    where += " AND read_at IS NULL";
+  }
+
+  const limitParam = params.length + 1;
+  const offsetParam = params.length + 2;
+  const offset = (queryInput.page - 1) * queryInput.pageSize;
+
+  const [itemsResult, totalResult, unreadResult] = await Promise.all([
+    query<NotificationRow>(
+      `SELECT id, type, severity, title_key, body_key, params, read_at, created_at
+       FROM notifications
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT $${limitParam} OFFSET $${offsetParam}`,
+      [...params, queryInput.pageSize, offset]
+    ),
+    query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM notifications ${where}`,
+      params
+    ),
+    query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count
+       FROM notifications
+       WHERE restaurant_id = $1 AND user_id = $2 AND read_at IS NULL`,
+      [restaurantId, userId]
+    )
   ]);
 
   return {
-    items: items.map((item) => ({
+    items: itemsResult.rows.map((item) => ({
       id: item.id,
       type: item.type,
       severity: item.severity,
-      titleKey: item.titleKey,
-      bodyKey: item.bodyKey,
+      titleKey: item.title_key,
+      bodyKey: item.body_key,
       params: item.params,
-      readAt: item.readAt?.toISOString() ?? null,
-      createdAt: item.createdAt.toISOString()
+      readAt: item.read_at?.toISOString() ?? null,
+      createdAt: item.created_at.toISOString()
     })),
-    total,
-    unread,
-    page: query.page,
-    pageSize: query.pageSize
+    total: totalResult.rows[0]?.count ?? 0,
+    unread: unreadResult.rows[0]?.count ?? 0,
+    page: queryInput.page,
+    pageSize: queryInput.pageSize
   };
 }
 
@@ -46,27 +72,38 @@ export async function markNotificationRead(
   userId: string,
   notificationId: string
 ) {
-  const notification = await prisma.notification.findFirst({
-    where: { id: notificationId, restaurantId, userId }
-  });
-  if (!notification) throw new NotFoundError("The notification was not found");
+  const { rows } = await query<{ id: string; read_at: Date | null }>(
+    `SELECT id, read_at FROM notifications
+     WHERE id = $1 AND restaurant_id = $2 AND user_id = $3`,
+    [notificationId, restaurantId, userId]
+  );
 
-  const updated = await prisma.notification.update({
-    where: { id: notificationId },
-    data: { readAt: notification.readAt ?? new Date() }
-  });
+  if (!rows[0]) {
+    throw new NotFoundError("The notification was not found");
+  }
+
+  const { rows: updated } = await query<{ id: string; read_at: Date | null }>(
+    `UPDATE notifications
+     SET read_at = COALESCE(read_at, NOW())
+     WHERE id = $1
+     RETURNING id, read_at`,
+    [notificationId]
+  );
+  const notification = updated[0]!;
 
   return {
-    id: updated.id,
-    readAt: updated.readAt?.toISOString() ?? null
+    id: notification.id,
+    readAt: notification.read_at?.toISOString() ?? null
   };
 }
 
 export async function markAllNotificationsRead(restaurantId: string, userId: string) {
-  const result = await prisma.notification.updateMany({
-    where: { restaurantId, userId, readAt: null },
-    data: { readAt: new Date() }
-  });
+  const result = await query(
+    `UPDATE notifications
+     SET read_at = NOW()
+     WHERE restaurant_id = $1 AND user_id = $2 AND read_at IS NULL`,
+    [restaurantId, userId]
+  );
 
-  return { updated: result.count };
+  return { updated: result.rowCount ?? 0 };
 }

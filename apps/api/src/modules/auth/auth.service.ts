@@ -1,12 +1,16 @@
 import bcrypt from "bcryptjs";
-import { Prisma, type User } from "@prisma/client";
 import { env } from "../../config/env.js";
-import { prisma } from "../../lib/prisma.js";
-import { AppError, BadRequestError, ConflictError, UnauthorizedError } from "../../lib/errors.js";
+import { pool, query, transaction, type DbClient } from "../../lib/db.js";
+import {
+  AppError,
+  BadRequestError,
+  ConflictError,
+  UnauthorizedError
+} from "../../lib/errors.js";
 import { hashPassword, validatePassword, verifyPassword } from "../../lib/password.js";
 import { normalizeEmail, normalizePhone } from "../../lib/phone.js";
 import { signAccessToken } from "../../lib/jwt.js";
-import { resolvePermissions } from "../../lib/permissions.js";
+import { resolvePermissions, type PermissionEffect } from "../../lib/permissions.js";
 import { generateRefreshToken, hashRefreshToken } from "../../lib/refresh-tokens.js";
 import type {
   ChangePasswordInput,
@@ -58,124 +62,166 @@ export type UserProfile = {
   }>;
 };
 
-const userProfileSelect = {
-  id: true,
-  phone: true,
-  email: true,
-  fullName: true,
-  language: true,
-  status: true,
-  mustChangePassword: true,
-  lastLoginAt: true,
-  createdAt: true,
-  memberships: {
-    where: {
-      status: "ACTIVE",
-      restaurant: { status: "ACTIVE" }
-    },
-    orderBy: { createdAt: "asc" },
-    select: {
-      id: true,
-      status: true,
-      joinedAt: true,
-      restaurant: {
-        select: {
-          id: true,
-          name: true,
-          currency: true,
-          timezone: true,
-          status: true
-        }
-      },
-      role: {
-        select: {
-          key: true,
-          name: true,
-          permissions: {
-            select: {
-              permission: { select: { key: true } }
-            }
-          }
-        }
-      },
-      permissionOverrides: {
-        select: {
-          effect: true,
-          permission: { select: { key: true } }
-        }
-      }
-    }
-  }
-} satisfies Prisma.UserSelect;
+type UserRow = {
+  id: string;
+  phone: string;
+  email: string | null;
+  full_name: string;
+  language: "EN" | "NY";
+  status: string;
+  must_change_password: boolean;
+  last_login_at: Date | null;
+  created_at: Date;
+  password_hash: string;
+};
 
-type UserProfileRecord = Prisma.UserGetPayload<{ select: typeof userProfileSelect }>;
-
-function serializeProfile(user: UserProfileRecord): UserProfile {
-  return {
-    id: user.id,
-    phone: user.phone,
-    email: user.email,
-    fullName: user.fullName,
-    language: user.language === "NY" ? "ny" : "en",
-    status: user.status,
-    mustChangePassword: user.mustChangePassword,
-    lastLoginAt: user.lastLoginAt?.toISOString() ?? null,
-    createdAt: user.createdAt.toISOString(),
-    memberships: user.memberships.map((membership) => ({
-      id: membership.id,
-      status: membership.status,
-      joinedAt: membership.joinedAt.toISOString(),
-      restaurant: membership.restaurant,
-      role: {
-        key: membership.role.key,
-        name: membership.role.name
-      },
-      permissions: resolvePermissions(
-        membership.role.permissions.map(({ permission }) => permission.key),
-        membership.permissionOverrides.map((override) => ({
-          key: override.permission.key,
-          effect: override.effect
-        }))
-      )
-    }))
-  };
-}
+type MembershipRow = {
+  id: string;
+  status: string;
+  joined_at: Date;
+  role_id: string;
+  role_key: string;
+  role_name: string;
+  restaurant_id: string;
+  restaurant_name: string;
+  restaurant_currency: string;
+  restaurant_timezone: string;
+  restaurant_status: string;
+};
 
 function languageValue(language: "en" | "ny"): "EN" | "NY" {
   return language === "ny" ? "NY" : "EN";
 }
 
 function isUniqueConstraintError(error: unknown): boolean {
-  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: string }).code === "23505"
+  );
+}
+
+async function serializeProfile(
+  client: Pick<DbClient, "query"> | typeof pool,
+  user: UserRow
+): Promise<UserProfile> {
+  const { rows: memberships } = await client.query<MembershipRow>(
+    `SELECT ru.id, ru.status, ru.joined_at, ru.role_id,
+            ro.key AS role_key, ro.name AS role_name,
+            r.id AS restaurant_id, r.name AS restaurant_name,
+            r.currency AS restaurant_currency, r.timezone AS restaurant_timezone,
+            r.status AS restaurant_status
+     FROM restaurant_users ru
+     JOIN restaurants r ON r.id = ru.restaurant_id
+     JOIN roles ro ON ro.id = ru.role_id
+     WHERE ru.user_id = $1 AND ru.status = 'ACTIVE' AND r.status = 'ACTIVE'
+     ORDER BY ru.created_at ASC`,
+    [user.id]
+  );
+
+  const { rows: rolePermissions } = await client.query<{
+    role_id: string;
+    key: string;
+  }>(
+    `SELECT rp.role_id, p.key
+     FROM role_permissions rp
+     JOIN permissions p ON p.id = rp.permission_id
+     WHERE rp.role_id = ANY($1::uuid[])`,
+    [memberships.map((membership) => membership.role_id)]
+  );
+
+  const { rows: overrides } = await client.query<{
+    restaurant_user_id: string;
+    effect: PermissionEffect;
+    key: string;
+  }>(
+    `SELECT rup.restaurant_user_id, rup.effect, p.key
+     FROM restaurant_user_permissions rup
+     JOIN permissions p ON p.id = rup.permission_id
+     WHERE rup.restaurant_user_id = ANY($1::uuid[])`,
+    [memberships.map((membership) => membership.id)]
+  );
+
+  const rolePermissionsByRole = new Map<string, string[]>();
+  for (const permission of rolePermissions) {
+    const list = rolePermissionsByRole.get(permission.role_id) ?? [];
+    list.push(permission.key);
+    rolePermissionsByRole.set(permission.role_id, list);
+  }
+
+  const overridesByMembership = new Map<
+    string,
+    Array<{ key: string; effect: PermissionEffect }>
+  >();
+  for (const override of overrides) {
+    const list = overridesByMembership.get(override.restaurant_user_id) ?? [];
+    list.push({ key: override.key, effect: override.effect });
+    overridesByMembership.set(override.restaurant_user_id, list);
+  }
+
+  return {
+    id: user.id,
+    phone: user.phone,
+    email: user.email,
+    fullName: user.full_name,
+    language: user.language === "NY" ? "ny" : "en",
+    status: user.status,
+    mustChangePassword: user.must_change_password,
+    lastLoginAt: user.last_login_at?.toISOString() ?? null,
+    createdAt: user.created_at.toISOString(),
+    memberships: memberships.map((membership) => ({
+      id: membership.id,
+      status: membership.status,
+      joinedAt: membership.joined_at.toISOString(),
+      restaurant: {
+        id: membership.restaurant_id,
+        name: membership.restaurant_name,
+        currency: membership.restaurant_currency,
+        timezone: membership.restaurant_timezone,
+        status: membership.restaurant_status
+      },
+      role: {
+        key: membership.role_key,
+        name: membership.role_name
+      },
+      permissions: resolvePermissions(
+        rolePermissionsByRole.get(membership.role_id) ?? [],
+        overridesByMembership.get(membership.id) ?? []
+      )
+    }))
+  };
 }
 
 async function getUserProfile(userId: string): Promise<UserProfile> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: userProfileSelect
-  });
+  const { rows } = await query<UserRow>(`SELECT * FROM users WHERE id = $1`, [userId]);
+  const user = rows[0];
 
   if (!user || user.status !== "ACTIVE") {
     throw new UnauthorizedError("The account is not active");
   }
 
-  return serializeProfile(user);
+  return serializeProfile(pool, user);
 }
 
 async function issueSession(userId: string, metadata: RequestMetadata): Promise<SessionTokens> {
   const refresh = generateRefreshToken();
   const access = signAccessToken(userId);
 
-  await prisma.refreshToken.create({
-    data: {
+  await query(
+    `INSERT INTO refresh_tokens
+       (id, user_id, token_hash, family_id, expires_at, created_by_ip, user_agent, created_at)
+     VALUES
+       (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())`,
+    [
       userId,
-      tokenHash: refresh.tokenHash,
-      familyId: refresh.familyId,
-      expiresAt: refresh.expiresAt,
-      createdByIp: metadata.ip,
-      userAgent: metadata.userAgent
-    }
-  });
+      refresh.tokenHash,
+      refresh.familyId,
+      refresh.expiresAt,
+      metadata.ip ?? null,
+      metadata.userAgent ?? null
+    ]
+  );
 
   return {
     accessToken: access.token,
@@ -185,17 +231,19 @@ async function issueSession(userId: string, metadata: RequestMetadata): Promise<
   };
 }
 
-async function findUserByIdentifier(identifier: string): Promise<User | null> {
+async function findUserByIdentifier(identifier: string): Promise<UserRow | null> {
   if (identifier.includes("@")) {
-    return prisma.user.findUnique({
-      where: { email: normalizeEmail(identifier) }
-    });
+    const { rows } = await query<UserRow>(`SELECT * FROM users WHERE email = $1`, [
+      normalizeEmail(identifier)
+    ]);
+    return rows[0] ?? null;
   }
 
   try {
-    return prisma.user.findUnique({
-      where: { phone: normalizePhone(identifier) }
-    });
+    const { rows } = await query<UserRow>(`SELECT * FROM users WHERE phone = $1`, [
+      normalizePhone(identifier)
+    ]);
+    return rows[0] ?? null;
   } catch {
     return null;
   }
@@ -221,25 +269,21 @@ export async function register(
   let userId: string;
 
   try {
-    userId = await prisma.$transaction(async (transaction) => {
-      const existing = await transaction.user.findFirst({
-        where: {
-          OR: [
-            { phone },
-            ...(email ? [{ email }] : [])
-          ]
-        },
-        select: { id: true }
-      });
+    userId = await transaction(async (client) => {
+      const { rows: existing } = await client.query(
+        `SELECT id FROM users WHERE phone = $1 OR ($2::varchar IS NOT NULL AND email = $2)
+         LIMIT 1`,
+        [phone, email]
+      );
 
-      if (existing) {
+      if (existing.length > 0) {
         throw new ConflictError("A user with this phone number or email already exists");
       }
 
-      const ownerRole = await transaction.role.findUnique({
-        where: { key: "OWNER" },
-        select: { id: true }
-      });
+      const { rows: ownerRoles } = await client.query<{ id: string }>(
+        `SELECT id FROM roles WHERE key = 'OWNER' LIMIT 1`
+      );
+      const ownerRole = ownerRoles[0];
 
       if (!ownerRole) {
         throw new AppError(
@@ -249,41 +293,41 @@ export async function register(
         );
       }
 
-      const user = await transaction.user.create({
-        data: {
-          phone,
-          email,
-          fullName: input.fullName,
-          passwordHash,
-          language: languageValue(input.language),
-          lastLoginAt: new Date()
-        },
-        select: { id: true }
-      });
+      const { rows: users } = await client.query<{ id: string }>(
+        `INSERT INTO users
+           (id, phone, email, full_name, password_hash, language, last_login_at, created_at, updated_at)
+         VALUES
+           (gen_random_uuid(), $1, $2, $3, $4, $5, NOW(), NOW(), NOW())
+         RETURNING id`,
+        [phone, email, input.fullName, passwordHash, languageValue(input.language)]
+      );
+      const user = users[0]!;
 
-      const restaurant = await transaction.restaurant.create({
-        data: {
-          name: input.restaurantName,
-          phone: restaurantPhone,
+      const { rows: restaurants } = await client.query<{ id: string }>(
+        `INSERT INTO restaurants
+           (id, name, phone, email, address_line, city, created_at, updated_at)
+         VALUES
+           (gen_random_uuid(), $1, $2, $3, $4, $5, NOW(), NOW())
+         RETURNING id`,
+        [
+          input.restaurantName,
+          restaurantPhone,
           email,
-          addressLine: input.restaurantAddress,
-          city: input.city
-        },
-        select: { id: true }
-      });
+          input.restaurantAddress ?? null,
+          input.city ?? null
+        ]
+      );
+      const restaurant = restaurants[0]!;
 
-      await transaction.restaurantUser.create({
-        data: {
-          restaurantId: restaurant.id,
-          userId: user.id,
-          roleId: ownerRole.id
-        }
-      });
+      await client.query(
+        `INSERT INTO restaurant_users
+           (id, restaurant_id, user_id, role_id, status, joined_at, created_at, updated_at)
+         VALUES
+           (gen_random_uuid(), $1, $2, $3, 'ACTIVE', NOW(), NOW(), NOW())`,
+        [restaurant.id, user.id, ownerRole.id]
+      );
 
       return user.id;
-    }, {
-      maxWait: 10_000,
-      timeout: 20_000
     });
   } catch (error) {
     if (isUniqueConstraintError(error)) {
@@ -310,16 +354,15 @@ export async function login(
     throw new UnauthorizedError("Invalid phone/email or password");
   }
 
-  const passwordMatches = await verifyPassword(input.password, user.passwordHash);
+  const passwordMatches = await verifyPassword(input.password, user.password_hash);
 
   if (!passwordMatches || user.status !== "ACTIVE") {
     throw new UnauthorizedError("Invalid phone/email or password");
   }
 
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { lastLoginAt: new Date() }
-  });
+  await query(`UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1`, [
+    user.id
+  ]);
 
   return {
     user: await getUserProfile(user.id),
@@ -340,100 +383,98 @@ export async function refreshSession(
 ): Promise<{ user: UserProfile; tokens: SessionTokens }> {
   const tokenHash = hashRefreshToken(rawToken);
 
-  const outcome: RefreshOutcome = await prisma.$transaction(async (transaction) => {
-    const stored = await transaction.refreshToken.findUnique({
-      where: { tokenHash },
-      select: {
-        id: true,
-        userId: true,
-        familyId: true,
-        expiresAt: true,
-        revokedAt: true
-      }
-    });
+  const outcome: RefreshOutcome = await transaction(async (client) => {
+    const { rows } = await client.query<{
+      id: string;
+      user_id: string;
+      family_id: string;
+      expires_at: Date;
+      revoked_at: Date | null;
+    }>(
+      `SELECT id, user_id, family_id, expires_at, revoked_at
+       FROM refresh_tokens
+       WHERE token_hash = $1
+       FOR UPDATE`,
+      [tokenHash]
+    );
+    const stored = rows[0];
 
     if (!stored) {
       return { kind: "invalid" };
     }
 
-    if (stored.revokedAt) {
-      await transaction.refreshToken.updateMany({
-        where: { familyId: stored.familyId, revokedAt: null },
-        data: {
-          revokedAt: new Date(),
-          revokedReason: "REUSE_DETECTED"
-        }
-      });
+    if (stored.revoked_at) {
+      await client.query(
+        `UPDATE refresh_tokens
+         SET revoked_at = NOW(), revoked_reason = 'REUSE_DETECTED'
+         WHERE family_id = $1 AND revoked_at IS NULL`,
+        [stored.family_id]
+      );
 
       return { kind: "reuse" };
     }
 
-    if (stored.expiresAt.getTime() <= Date.now()) {
-      await transaction.refreshToken.update({
-        where: { id: stored.id },
-        data: {
-          revokedAt: new Date(),
-          revokedReason: "EXPIRED"
-        }
-      });
+    if (stored.expires_at.getTime() <= Date.now()) {
+      await client.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = 'EXPIRED' WHERE id = $1`,
+        [stored.id]
+      );
 
       return { kind: "expired" };
     }
 
-    const user = await transaction.user.findUnique({
-      where: { id: stored.userId },
-      select: { status: true }
-    });
+    const { rows: users } = await client.query<{ status: string }>(
+      `SELECT status FROM users WHERE id = $1`,
+      [stored.user_id]
+    );
 
-    if (!user || user.status !== "ACTIVE") {
-      await transaction.refreshToken.updateMany({
-        where: { userId: stored.userId, revokedAt: null },
-        data: {
-          revokedAt: new Date(),
-          revokedReason: "ACCOUNT_INACTIVE"
-        }
-      });
+    if (!users[0] || users[0].status !== "ACTIVE") {
+      await client.query(
+        `UPDATE refresh_tokens
+         SET revoked_at = NOW(), revoked_reason = 'ACCOUNT_INACTIVE'
+         WHERE user_id = $1 AND revoked_at IS NULL`,
+        [stored.user_id]
+      );
 
       return { kind: "inactive" };
     }
 
-    const refresh = generateRefreshToken(stored.familyId);
+    const refresh = generateRefreshToken(stored.family_id);
 
-    const rotated = await transaction.refreshToken.updateMany({
-      where: { id: stored.id, revokedAt: null },
-      data: {
-        revokedAt: new Date(),
-        revokedReason: "ROTATED"
-      }
-    });
+    const rotated = await client.query(
+      `UPDATE refresh_tokens
+       SET revoked_at = NOW(), revoked_reason = 'ROTATED'
+       WHERE id = $1 AND revoked_at IS NULL`,
+      [stored.id]
+    );
 
-    if (rotated.count === 0) {
-      await transaction.refreshToken.updateMany({
-        where: { familyId: stored.familyId, revokedAt: null },
-        data: {
-          revokedAt: new Date(),
-          revokedReason: "REUSE_DETECTED"
-        }
-      });
+    if (rotated.rowCount === 0) {
+      await client.query(
+        `UPDATE refresh_tokens
+         SET revoked_at = NOW(), revoked_reason = 'REUSE_DETECTED'
+         WHERE family_id = $1 AND revoked_at IS NULL`,
+        [stored.family_id]
+      );
 
       return { kind: "reuse" };
     }
 
-    await transaction.refreshToken.create({
-      data: {
-        userId: stored.userId,
-        tokenHash: refresh.tokenHash,
-        familyId: refresh.familyId,
-        expiresAt: refresh.expiresAt,
-        createdByIp: metadata.ip,
-        userAgent: metadata.userAgent
-      }
-    });
+    await client.query(
+      `INSERT INTO refresh_tokens
+         (id, user_id, token_hash, family_id, expires_at, created_by_ip, user_agent, created_at)
+       VALUES
+         (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())`,
+      [
+        stored.user_id,
+        refresh.tokenHash,
+        refresh.familyId,
+        refresh.expiresAt,
+        metadata.ip ?? null,
+        metadata.userAgent ?? null
+      ]
+    );
 
-    return { kind: "ok", userId: stored.userId, refresh };
-  }, {
-    maxWait: 10_000,
-    timeout: 20_000
+    return { kind: "ok", userId: stored.user_id, refresh };
   });
 
   if (outcome.kind !== "ok") {
@@ -456,13 +497,12 @@ export async function refreshSession(
 export async function logout(rawToken: string): Promise<void> {
   const tokenHash = hashRefreshToken(rawToken);
 
-  await prisma.refreshToken.updateMany({
-    where: { tokenHash, revokedAt: null },
-    data: {
-      revokedAt: new Date(),
-      revokedReason: "LOGOUT"
-    }
-  });
+  await query(
+    `UPDATE refresh_tokens
+     SET revoked_at = NOW(), revoked_reason = 'LOGOUT'
+     WHERE token_hash = $1 AND revoked_at IS NULL`,
+    [tokenHash]
+  );
 }
 
 export async function getCurrentUser(userId: string): Promise<UserProfile> {
@@ -473,31 +513,41 @@ export async function updateProfile(
   userId: string,
   input: UpdateProfileInput
 ): Promise<UserProfile> {
-  const data: Prisma.UserUpdateInput = {};
+  const assignments: string[] = [];
+  const params: unknown[] = [];
 
   if (input.fullName !== undefined) {
-    data.fullName = input.fullName;
+    params.push(input.fullName);
+    assignments.push(`full_name = $${params.length}`);
   }
 
   if (input.language !== undefined) {
-    data.language = languageValue(input.language);
+    params.push(languageValue(input.language));
+    assignments.push(`language = $${params.length}`);
   }
 
   if (input.email !== undefined) {
-    data.email = input.email === null ? null : normalizeEmail(input.email);
+    params.push(input.email === null ? null : normalizeEmail(input.email));
+    assignments.push(`email = $${params.length}`);
   }
 
-  try {
-    await prisma.user.update({
-      where: { id: userId },
-      data
-    });
-  } catch (error) {
-    if (isUniqueConstraintError(error)) {
-      throw new ConflictError("This email address is already in use");
-    }
+  if (assignments.length > 0) {
+    params.push(userId);
 
-    throw error;
+    try {
+      await query(
+        `UPDATE users
+         SET ${assignments.join(", ")}, updated_at = NOW()
+         WHERE id = $${params.length}`,
+        params
+      );
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        throw new ConflictError("This email address is already in use");
+      }
+
+      throw error;
+    }
   }
 
   return getUserProfile(userId);
@@ -507,10 +557,12 @@ export async function changePassword(
   userId: string,
   input: ChangePasswordInput
 ): Promise<void> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { id: true, passwordHash: true, status: true }
-  });
+  const { rows } = await query<{
+    id: string;
+    password_hash: string;
+    status: string;
+  }>(`SELECT id, password_hash, status FROM users WHERE id = $1`, [userId]);
+  const user = rows[0];
 
   if (!user || user.status !== "ACTIVE") {
     throw new UnauthorizedError("The account is not active");
@@ -518,7 +570,7 @@ export async function changePassword(
 
   const currentPasswordMatches = await verifyPassword(
     input.currentPassword,
-    user.passwordHash
+    user.password_hash
   );
 
   if (!currentPasswordMatches) {
@@ -535,17 +587,19 @@ export async function changePassword(
 
   const passwordHash = await hashPassword(input.newPassword);
 
-  await prisma.$transaction([
-    prisma.user.update({
-      where: { id: userId },
-      data: { passwordHash, mustChangePassword: false }
-    }),
-    prisma.refreshToken.updateMany({
-      where: { userId, revokedAt: null },
-      data: {
-        revokedAt: new Date(),
-        revokedReason: "PASSWORD_CHANGED"
-      }
-    })
-  ]);
+  await transaction(async (client) => {
+    await client.query(
+      `UPDATE users
+       SET password_hash = $1, must_change_password = false, updated_at = NOW()
+       WHERE id = $2`,
+      [passwordHash, userId]
+    );
+
+    await client.query(
+      `UPDATE refresh_tokens
+       SET revoked_at = NOW(), revoked_reason = 'PASSWORD_CHANGED'
+       WHERE user_id = $1 AND revoked_at IS NULL`,
+      [userId]
+    );
+  });
 }

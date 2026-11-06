@@ -1,127 +1,182 @@
-import { pool, query, transaction } from "../../lib/db.js";
-import { BadRequestError, NotFoundError, ConflictError } from "../../lib/errors.js";
-import { lineTotalMinor } from "@rbm/shared";
-import { refreshLowStockNotifications } from "../inventory/inventory.service.js";
+﻿import { lineTotalMinor } from "@rbm/shared";
+import { recordAudit } from "../../lib/audit.js";
+import {
+  businessDateFrom,
+  dateOnlyToDate,
+  dateToDateOnly
+} from "../../lib/business-date.js";
+import { assertDayOpen } from "../../lib/day-lock.js";
+import { query, transaction } from "../../lib/db.js";
+import { decimal, roundTo, type Decimal } from "../../lib/decimal.js";
+import { BadRequestError, ConflictError, NotFoundError } from "../../lib/errors.js";
+import { getActiveRecipeCost } from "../../lib/recipe-cost.js";
 import { nextDocumentNumber } from "../../lib/sequence.js";
+import { refreshLowStockNotifications } from "../inventory/inventory.service.js";
 
 type AuditMeta = { ip?: string; userAgent?: string };
 
-// Helper: Convert pg result values to BigInt safely
-const toBigInt = (val: any): bigint => {
-  if (val === null || val === undefined) return 0n;
-  if (typeof val === "bigint") return val;
-  if (typeof val === "string") {
-    const n = BigInt(val);
-    return isNaN(n) ? 0n : n;
-  }
-  return BigInt(val);
+type SaleRow = {
+  id: string;
+  transaction_number: string;
+  source: "ITEMIZED" | "MANUAL";
+  status: "COMPLETED" | "VOIDED";
+  occurred_at: Date;
+  business_date: string;
+  currency: string;
+  subtotal_minor: string;
+  total_minor: string;
+  notes: string | null;
+  customer_id: string | null;
+  customer_name: string | null;
+  recorded_by_user_id: string;
+  recorded_by_name: string;
+  voided_at: Date | null;
+  void_reason: string | null;
 };
 
-// SQL Queries (parameterized to prevent SQL injection)
-const SALES_BY_RESTAURANT = `
-  SELECT id, transaction_number, source, status, occurred_at, business_date,
-         currency, subtotal_minor, total_minor, notes, recorded_by_user_id, created_at
-  FROM sales
-  WHERE restaurant_id = $1
+type SaleItemRow = {
+  id: string;
+  sale_id: string;
+  product_id: string | null;
+  product_name: string;
+  quantity: string;
+  unit_price_minor: string;
+  line_total_minor: string;
+  cost_of_goods_minor: string | null;
+  notes: string | null;
+};
+
+type SalePaymentRow = {
+  id: string;
+  sale_id: string;
+  payment_method_id: string;
+  payment_method_key: string;
+  payment_method_name: string;
+  amount_minor: string;
+};
+
+const SALE_SELECT = `
+  SELECT s.id, s.transaction_number, s.source, s.status, s.occurred_at,
+         s.business_date, s.currency, s.subtotal_minor, s.total_minor, s.notes,
+         s.customer_id, c.name AS customer_name,
+         s.recorded_by_user_id, u.full_name AS recorded_by_name,
+         s.voided_at, s.void_reason
+  FROM sales s
+  LEFT JOIN customers c ON c.id = s.customer_id
+  JOIN users u ON u.id = s.recorded_by_user_id
 `;
 
-const SALE_BY_ID = `
-  SELECT * FROM sales WHERE id = $1
-`;
-
-const CREATE_SALE = `
-  INSERT INTO sales (restaurant_id, transaction_number, source, status, occurred_at,
-                     business_date, currency, subtotal_minor, total_minor, notes,
-                     recorded_by_user_id, client_id)
-  VALUES ($1, $2, $3, 'COMPLETED', $4, $5, $6, $7, $8, $9, $10, $11)
-  RETURNING *
-`;
-
-const UPDATE_SALE_VOID = `
-  UPDATE sales SET status = $1, voided_at = $2, void_reason = $3 WHERE id = $4
-`;
-
-const COUNT_SALES = `
-  SELECT COUNT(*)::int as total FROM sales WHERE restaurant_id = $1
-`;
-
-const GET_PAYMENT_METHODS = `
-  SELECT id, key, name FROM payment_method WHERE is_active = true AND (restaurant_id IS NULL OR restaurant_id = $1)
-`;
-
-const GET_PRODUCT_BY_ID = `
-  SELECT id, name, selling_price_minor, is_recipe_based FROM products WHERE id = $1 AND restaurant_id = $2 AND status = 'ACTIVE'
-`;
-
-const GET_INVENTORY_ITEM = `
-  SELECT id, current_quantity, name, unit FROM inventory_items WHERE id = $1 AND restaurant_id = $2
-`;
-
-const UPDATE_INVENTORY_QUANTITY = `
-  UPDATE inventory_items SET current_quantity = $1 WHERE id = $2 AND restaurant_id = $3
-`;
-
-const GET_CUSTOMER_BY_ID = `
-  SELECT id, name FROM customers WHERE id = $1 AND restaurant_id = $2
-`;
-
-const GET_STOCK_MOVEMENTS = `
-  SELECT * FROM stock_movements WHERE restaurant_id = $1 AND reference_id = $2 ORDER BY occurred_at DESC
-`;
-
-const INSERT_STOCK_MOVEMENT = `
-  INSERT INTO stock_movements (restaurant_id, inventory_item_id, type, quantity_delta, unit_cost_minor, value_minor, occurred_at, business_date, recorded_by_user_id, reason)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-`;
-
-const GET_SALE_ITEMS = `
-  SELECT * FROM sale_items WHERE sale_id = $1
-`;
-
-const INSERT_STOCK_MOVEMENT_RETURN = `
-  INSERT INTO stock_movements (restaurant_id, inventory_item_id, type, quantity_delta, unit_cost_minor, value_minor, occurred_at, business_date, recorded_by_user_id, reference_type, reference_id, reason)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-`;
-
-function serializeSale(sale: any) {
+function serializeSale(
+  sale: SaleRow,
+  items: SaleItemRow[],
+  payments: SalePaymentRow[]
+) {
   return {
     id: sale.id,
     transactionNumber: sale.transaction_number,
     source: sale.source,
     status: sale.status,
-    occurredAt: sale.occurredAt?.toISOString() || new Date().toISOString(),
-    businessDate: sale.business_date?.toString() || new Date().toISOString().split('T')[0],
-    currency: sale.currency || "MWK",
-    subtotalMinor: toBigInt(sale.subtotal_minor),
-    totalMinor: toBigInt(sale.total_minor),
+    occurredAt: sale.occurred_at.toISOString(),
+    businessDate: dateToDateOnly(sale.business_date),
+    currency: sale.currency,
+    subtotalMinor: sale.subtotal_minor.toString(),
+    totalMinor: sale.total_minor.toString(),
     notes: sale.notes,
-    customer: sale.customer,
-    recordedBy: sale.recorded_by_user_id,
-    voidedAt: sale.voidedAt?.toISOString() || null,
+    customer: sale.customer_id
+      ? { id: sale.customer_id, name: sale.customer_name }
+      : null,
+    recordedBy: { id: sale.recorded_by_user_id, fullName: sale.recorded_by_name },
+    voidedAt: sale.voided_at ? sale.voided_at.toISOString() : null,
     voidReason: sale.void_reason,
-    items: (sale.items || []).map((item: any) => ({
+    items: items.map((item) => ({
       id: item.id,
       productId: item.product_id,
       productName: item.product_name,
-      quantity: item.quantity !== undefined ? item.quantity.toFixed(4) : "0",
-      unitPriceMinor: toBigInt(item.unit_price_minor),
-      lineTotalMinor: toBigInt(item.line_total_minor),
-      costOfGoodsMinor: item.cost_of_goods_minor != null ? toBigInt(item.cost_of_goods_minor) : 0n,
+      quantity: decimal(item.quantity).toFixed(4),
+      unitPriceMinor: item.unit_price_minor.toString(),
+      lineTotalMinor: item.line_total_minor.toString(),
+      costOfGoodsMinor:
+        item.cost_of_goods_minor === null
+          ? null
+          : item.cost_of_goods_minor.toString(),
       notes: item.notes
     })),
-    payments: (sale.payments || []).map((payment: any) => ({
+    payments: payments.map((payment) => ({
       id: payment.id,
       paymentMethodId: payment.payment_method_id,
-      paymentMethodKey: payment.payment_method?.key || "",
-      paymentMethodName: payment.payment_method?.name || "",
-      amountMinor: toBigInt(payment.amount_minor)
+      paymentMethodKey: payment.payment_method_key,
+      paymentMethodName: payment.payment_method_name,
+      amountMinor: payment.amount_minor.toString()
     }))
   };
 }
 
+async function hydrateSales(sales: SaleRow[]) {
+  if (sales.length === 0) {
+    return [];
+  }
+
+  const ids = sales.map((sale) => sale.id);
+
+  const [{ rows: items }, { rows: payments }] = await Promise.all([
+    query<SaleItemRow>(
+      `SELECT id, sale_id, product_id, product_name, quantity,
+              unit_price_minor, line_total_minor, cost_of_goods_minor, notes
+       FROM sale_items
+       WHERE sale_id = ANY($1::uuid[])`,
+      [ids]
+    ),
+    query<SalePaymentRow>(
+      `SELECT sp.id, sp.sale_id, sp.payment_method_id,
+              pm.key AS payment_method_key, pm.name AS payment_method_name,
+              sp.amount_minor
+       FROM sale_payments sp
+       JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       WHERE sp.sale_id = ANY($1::uuid[])`,
+      [ids]
+    )
+  ]);
+
+  const itemsBySale = new Map<string, SaleItemRow[]>();
+  for (const item of items) {
+    const list = itemsBySale.get(item.sale_id) ?? [];
+    list.push(item);
+    itemsBySale.set(item.sale_id, list);
+  }
+
+  const paymentsBySale = new Map<string, SalePaymentRow[]>();
+  for (const payment of payments) {
+    const list = paymentsBySale.get(payment.sale_id) ?? [];
+    list.push(payment);
+    paymentsBySale.set(payment.sale_id, list);
+  }
+
+  return sales.map((sale) =>
+    serializeSale(
+      sale,
+      itemsBySale.get(sale.id) ?? [],
+      paymentsBySale.get(sale.id) ?? []
+    )
+  );
+}
+
+async function loadSale(restaurantId: string, saleId: string) {
+  const { rows } = await query<SaleRow>(
+    `${SALE_SELECT} WHERE s.id = $1 AND s.restaurant_id = $2`,
+    [saleId, restaurantId]
+  );
+
+  if (!rows[0]) {
+    throw new NotFoundError("The sale was not found");
+  }
+
+  const [serialized] = await hydrateSales(rows);
+  return serialized;
+}
+
 export async function listSales(
   restaurantId: string,
-  query: {
+  filters: {
     page: number;
     pageSize: number;
     startDate?: string;
@@ -130,62 +185,52 @@ export async function listSales(
     source?: "ITEMIZED" | "MANUAL";
   }
 ) {
-  const params: any[] = [restaurantId];
-  let whereClause = "WHERE restaurant_id = $1";
-  let paramIndex = 2;
+  const conditions = ["s.restaurant_id = $1"];
+  const params: unknown[] = [restaurantId];
 
-  if (query.status) {
-    whereClause += ` AND status = $${paramIndex}`;
-    params.push(query.status);
-    paramIndex++;
+  if (filters.status) {
+    params.push(filters.status);
+    conditions.push(`s.status = $${params.length}`);
+  }
+  if (filters.source) {
+    params.push(filters.source);
+    conditions.push(`s.source = $${params.length}`);
+  }
+  if (filters.startDate) {
+    params.push(dateToDateOnly(dateOnlyToDate(filters.startDate)));
+    conditions.push(`s.business_date >= $${params.length}`);
+  }
+  if (filters.endDate) {
+    params.push(dateToDateOnly(dateOnlyToDate(filters.endDate)));
+    conditions.push(`s.business_date <= $${params.length}`);
   }
 
-  if (query.source) {
-    whereClause += ` AND source = $${paramIndex}`;
-    params.push(query.source);
-    paramIndex++;
-  }
+  const where = `WHERE ${conditions.join(" AND ")}`;
+  const offset = (filters.page - 1) * filters.pageSize;
 
-  if (query.startDate || query.endDate) {
-    whereClause += ` AND occurred_at >= $${paramIndex}`;
-    params.push(query.startDate || "1900-01-01");
-    paramIndex++;
-    if (query.endDate) {
-      whereClause += ` AND occurred_at <= $${paramIndex}`;
-      params.push(query.endDate);
-      paramIndex++;
-    }
-  }
-
-  // Count total
-  const [{ count }] = await pool.query(
-    `SELECT COUNT(*)::int as total FROM sales ${whereClause}`,
-    params
-  );
-  const total = count || 0;
-
-  // Add pagination params
-  params.push(query.pageSize, (query.page - 1) * query.pageSize);
-
-  // Fetch page
-  const { rows } = await pool.query(
-    `SELECT * FROM sales ${whereClause} ORDER BY occurred_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-    params
-  );
+  const [{ rows }, { rows: countRows }] = await Promise.all([
+    query<SaleRow>(
+      `${SALE_SELECT} ${where} ORDER BY s.occurred_at DESC LIMIT $${
+        params.length + 1
+      } OFFSET $${params.length + 2}`,
+      [...params, filters.pageSize, offset]
+    ),
+    query<{ total: number }>(
+      `SELECT COUNT(*)::int AS total FROM sales s ${where}`,
+      params
+    )
+  ]);
 
   return {
-    items: rows.map(serializeSale),
-    total,
-    page: query.page,
-    pageSize: query.pageSize
+    items: await hydrateSales(rows),
+    total: Number(countRows[0]?.total ?? 0),
+    page: filters.page,
+    pageSize: filters.pageSize
   };
 }
 
 export async function getSale(restaurantId: string, saleId: string) {
-  const { rows } = await pool.query(SALE_BY_ID, [saleId]);
-
-  if (rows.length === 0) throw new NotFoundError("The sale was not found");
-  return serializeSale(rows[0]);
+  return loadSale(restaurantId, saleId);
 }
 
 type SaleInput = {
@@ -204,215 +249,375 @@ type SaleInput = {
   payments: Array<{ paymentMethodId: string; amountMinor: bigint }>;
 };
 
+type PreparedItem = {
+  productId: string | null;
+  productName: string;
+  quantity: string;
+  quantityDecimal: Decimal;
+  unitPriceMinor: bigint;
+  lineTotalMinor: bigint;
+  costOfGoodsMinor: bigint | null;
+  recipeId: string | null;
+  notes?: string;
+};
+
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: string }).code === "23505"
+  );
+}
+
 export async function createSale(
   restaurantId: string,
   actorUserId: string,
   input: SaleInput,
   meta: AuditMeta
 ) {
-  const result = await transaction(async (client) => {
-    // 1. Check for existing sale with same clientId
-    if (input.clientId) {
-      const { rows: existing } = await client.query(
-        `SELECT * FROM sales WHERE restaurant_id = $1 AND client_id = $2`,
-        [restaurantId, input.clientId]
-      );
-      if (existing.length > 0) {
-        return { success: true, sale: serializeSale(existing[0]) };
-      }
-    }
-
-    // 2. Validate restaurant exists
-    const { rows: restaurant } = await client.query(
-      `SELECT id, timezone, currency FROM restaurants WHERE id = $1`,
-      [restaurantId]
+  if (input.clientId) {
+    const { rows } = await query<SaleRow>(
+      `${SALE_SELECT} WHERE s.restaurant_id = $1 AND s.client_id = $2`,
+      [restaurantId, input.clientId]
     );
-    if (restaurant.length === 0) throw new NotFoundError("Restaurant not found");
-    const restaurantData = restaurant[0];
-
-    // 3. Parse occurredAt and calculate business date
-    const occurredAt = new Date(input.occurredAt);
-    const businessDate = occurredAt.toISOString().split('T')[0];
-
-    // 4. Validate payment methods
-    const methodIds = [...new Set(input.payments.map((payment) => payment.paymentMethodId))];
-    const { rows: methods } = await client.query(GET_PAYMENT_METHODS, [restaurantId]);
-    const validMethodIds = new Set(methods.map((m: any) => m.id));
-    const allMethodsValid = methodIds.every(id => validMethodIds.has(id));
-    if (!allMethodsValid) throw new NotFoundError("A payment method was not found");
-
-    // 5. Validate customer if provided
-    if (input.customerId) {
-      const { rows: customer } = await client.query(
-        `SELECT id, name FROM customers WHERE id = $1 AND restaurant_id = $2`,
-        [input.customerId, restaurantId]
-      );
-      if (customer.length === 0) throw new NotFoundError("The customer was not found");
+    if (rows[0]) {
+      const [serialized] = await hydrateSales(rows);
+      return serialized;
     }
+  }
 
-    // 6. Process items and calculate subtotal
-    const preparedItems: any[] = [];
-    let subtotal = 0n;
+  const occurredAt = new Date(input.occurredAt);
+  const { rows: restaurantRows } = await query<{
+    timezone: string;
+    currency: string;
+  }>("SELECT timezone, currency FROM restaurants WHERE id = $1", [restaurantId]);
 
-    for (const item of input.items) {
-      // Validate product exists and get price
-      let productId = item.productId;
-      let unitPriceMinor = toBigInt(item.unitPriceMinor);
-      let productName = item.productName;
+  const restaurant = restaurantRows[0];
+  if (!restaurant) {
+    throw new NotFoundError("The restaurant was not found");
+  }
 
-      if (item.productId) {
-        const { rows: product } = await client.query(
-          `SELECT id, name, selling_price_minor, is_recipe_based FROM products WHERE id = $1 AND restaurant_id = $2 AND status = 'ACTIVE'`,
-          [item.productId, restaurantId]
-        );
-        if (product.length === 0) throw new NotFoundError("Product not found");
-        const productData = product[0];
-        productName = productData.name;
-        unitPriceMinor = toBigInt(productData.selling_price_minor);
-        productId = productData.id;
-      } else if (unitPriceMinor <= 0n) {
-        throw new BadRequestError("A custom item must have a positive price");
+  const businessDate = dateToDateOnly(
+    businessDateFrom(occurredAt, restaurant.timezone)
+  );
+
+  let saleId: string;
+
+  try {
+    saleId = await transaction(async (client) => {
+      await assertDayOpen(client, restaurantId, businessDate);
+
+      const methodIds = [
+        ...new Set(input.payments.map((payment) => payment.paymentMethodId))
+      ];
+      const { rows: methods } = await client.query<{ id: string }>(
+        `SELECT id FROM payment_methods
+         WHERE id = ANY($1::uuid[]) AND is_active = true
+           AND (restaurant_id = $2 OR restaurant_id IS NULL)`,
+        [methodIds, restaurantId]
+      );
+      if (methods.length !== methodIds.length) {
+        throw new NotFoundError("A payment method was not found");
       }
 
-      const quantity = toBigInt(item.quantity);
-      if (quantity <= 0n) throw new BadRequestError("Sale quantities must be greater than zero");
+      if (input.customerId) {
+        const { rows: customers } = await client.query<{ id: string }>(
+          "SELECT id FROM customers WHERE id = $1 AND restaurant_id = $2",
+          [input.customerId, restaurantId]
+        );
+        if (!customers[0]) {
+          throw new NotFoundError("The customer was not found");
+        }
+      }
 
-      const lineTotal = lineTotalMinor(item.quantity, unitPriceMinor);
-      subtotal += lineTotal;
+      const preparedItems: PreparedItem[] = [];
+      const consumption = new Map<string, Decimal>();
 
-      preparedItems.push({
-        productId,
-        productName,
-        quantity: item.quantity,
-        unitPriceMinor,
-        lineTotalMinor: lineTotal,
-        costOfGoodsMinor: 0n,
-        notes: item.notes
-      });
-    }
+      if (input.source === "ITEMIZED") {
+        for (const item of input.items) {
+          const quantityDecimal = decimal(item.quantity);
+          if (quantityDecimal.lte(0)) {
+            throw new BadRequestError(
+              "Sale quantities must be greater than zero"
+            );
+          }
 
-    // 7. Validate subtotal
-    if (subtotal <= 0n) throw new BadRequestError("The sale total must be greater than zero");
+          let productName = item.productName;
+          let unitPriceMinor = item.unitPriceMinor;
+          let productId: string | null = null;
+          let isRecipeBased = false;
 
-    // 8. Validate payments match subtotal
-    const paid = input.payments.reduce((sum, p) => sum + toBigInt(p.amountMinor), 0n);
-    if (paid !== subtotal) {
-      throw new BadRequestError(
-        "Payments must equal the sale total",
-        { expectedMinor: subtotal.toString(), receivedMinor: paid.toString() }
+          if (item.productId) {
+            const { rows: products } = await client.query<{
+              id: string;
+              name: string;
+              selling_price_minor: string;
+              is_recipe_based: boolean;
+            }>(
+              `SELECT id, name, selling_price_minor, is_recipe_based
+               FROM products
+               WHERE id = $1 AND restaurant_id = $2 AND status = 'ACTIVE'`,
+              [item.productId, restaurantId]
+            );
+            const product = products[0];
+            if (!product) {
+              throw new NotFoundError("A product was not found");
+            }
+            productId = product.id;
+            productName = product.name;
+            unitPriceMinor = BigInt(product.selling_price_minor);
+            isRecipeBased = product.is_recipe_based;
+          } else if (unitPriceMinor <= 0n) {
+            throw new BadRequestError("A custom item must have a positive price");
+          }
+
+          const lineTotal = lineTotalMinor(item.quantity, unitPriceMinor);
+          let costOfGoods: bigint | null = null;
+          let recipeId: string | null = null;
+
+          if (isRecipeBased && productId) {
+            const cost = await getActiveRecipeCost(
+              client,
+              restaurantId,
+              productId
+            );
+            if (!cost) {
+              throw new BadRequestError(
+                `${productName} has no active recipe and cannot be sold`
+              );
+            }
+            recipeId = cost.recipeId;
+            costOfGoods = roundTo(
+              decimal(cost.costPerYieldUnitMinor).mul(quantityDecimal),
+              0
+            );
+
+            for (const line of cost.lines) {
+              const needed = decimal(line.quantityPerYieldUnit).mul(
+                quantityDecimal
+              );
+              consumption.set(
+                line.inventoryItemId,
+                (consumption.get(line.inventoryItemId) ?? decimal(0)).plus(
+                  needed
+                )
+              );
+            }
+          }
+
+          preparedItems.push({
+            productId,
+            productName,
+            quantity: item.quantity,
+            quantityDecimal,
+            unitPriceMinor,
+            lineTotalMinor: lineTotal,
+            costOfGoodsMinor: costOfGoods,
+            recipeId,
+            notes: item.notes
+          });
+        }
+      }
+
+      const subtotal =
+        input.source === "MANUAL"
+          ? input.payments.reduce((sum, payment) => sum + payment.amountMinor, 0n)
+          : preparedItems.reduce((sum, item) => sum + item.lineTotalMinor, 0n);
+
+      if (subtotal <= 0n) {
+        throw new BadRequestError("The sale total must be greater than zero");
+      }
+
+      const paid = input.payments.reduce(
+        (sum, payment) => sum + payment.amountMinor,
+        0n
       );
-    }
+      if (paid !== subtotal) {
+        throw new BadRequestError("Payments must equal the sale total", {
+          expectedMinor: subtotal.toString(),
+          receivedMinor: paid.toString()
+        });
+      }
 
-    // 8. Create sale (INSERT with RETURNING)
-    const transactionNumber = await nextDocumentNumber(client, restaurantId, "SALE", businessDate);
+      if (consumption.size > 0) {
+        const inventoryIds = [...consumption.keys()];
+        const { rows: stockRows } = await client.query<{
+          id: string;
+          name: string;
+          current_quantity: string;
+        }>(
+          `SELECT id, name, current_quantity FROM inventory_items
+           WHERE id = ANY($1::uuid[]) AND restaurant_id = $2`,
+          [inventoryIds, restaurantId]
+        );
+        const stockById = new Map(stockRows.map((row) => [row.id, row]));
 
-    const { rows: newSale } = await client.query(CREATE_SALE, [
-      restaurantId,
-      transactionNumber,
-      input.source,
-      occurredAt,
-      businessDate,
-      "MWK",
-      subtotal,
-      subtotal,
-      input.notes,
-      actorUserId,
-      input.clientId
-    ]);
+        for (const [inventoryItemId, needed] of consumption) {
+          const stock = stockById.get(inventoryItemId);
+          if (!stock) {
+            throw new NotFoundError("A recipe inventory item was not found");
+          }
+          const available = decimal(stock.current_quantity);
+          if (available.lt(needed)) {
+            throw new BadRequestError(
+              `Not enough stock for ${stock.name}: ${available.toFixed(2)} available`
+            );
+          }
+        }
+      }
 
-    const saleId = newSale.id;
+      const transactionNumber = await nextDocumentNumber(
+        client,
+        restaurantId,
+        "SALE",
+        businessDate
+      );
 
-    // 9. Insert sale items
-    for (const item of preparedItems) {
-      await client.query(
-        `INSERT INTO sale_items (sale_id, product_id, product_name, quantity,
-                                 unit_price_minor, line_total_minor, cost_of_goods_minor, recipe_id, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      const { rows: saleRows } = await client.query<{ id: string }>(
+        `INSERT INTO sales
+           (id, restaurant_id, transaction_number, source, status,
+            occurred_at, business_date, currency, subtotal_minor, total_minor,
+            notes, customer_id, recorded_by_user_id, client_id, created_at, updated_at)
+         VALUES
+           (gen_random_uuid(), $1, $2, $3, 'COMPLETED',
+            $4, $5, $6, $7, $8,
+            $9, $10, $11, $12, NOW(), NOW())
+         RETURNING id`,
         [
-          saleId,
-          item.productId,
-          item.productName,
-          item.quantity,
-          item.unitPriceMinor,
-          item.lineTotalMinor,
-          item.costOfGoodsMinor,
-          null,
-          item.notes
+          restaurantId,
+          transactionNumber,
+          input.source,
+          occurredAt,
+          businessDate,
+          restaurant.currency,
+          subtotal.toString(),
+          subtotal.toString(),
+          input.notes ?? null,
+          input.customerId ?? null,
+          actorUserId,
+          input.clientId ?? null
         ]
       );
-    }
 
-    // 10. Insert payments
-    for (const payment of input.payments) {
-      await client.query(
-        `INSERT INTO sale_payments (sale_id, payment_method_id, amount_minor) VALUES ($1, $2, $3)`,
-        [saleId, payment.paymentMethodId, toBigInt(payment.amountMinor)]
-      );
-    }
+      const sale = saleRows[0];
+      if (!sale) {
+        throw new ConflictError("The sale could not be recorded");
+      }
 
-    // 11. Update inventory - deduct stock
-    for (const item of preparedItems) {
-      if (item.productId) {
-        const { rows: inv } = await client.query(
-          `SELECT id, current_quantity, name, unit FROM inventory_items WHERE id = $1 AND restaurant_id = $2`,
-          [item.productId, restaurantId]
+      for (const item of preparedItems) {
+        await client.query(
+          `INSERT INTO sale_items
+             (id, sale_id, product_id, product_name, quantity,
+              unit_price_minor, line_total_minor, cost_of_goods_minor, recipe_id, notes)
+           VALUES
+             (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            sale.id,
+            item.productId,
+            item.productName,
+            item.quantityDecimal.toFixed(4),
+            item.unitPriceMinor.toString(),
+            item.lineTotalMinor.toString(),
+            item.costOfGoodsMinor?.toString() ?? null,
+            item.recipeId,
+            item.notes ?? null
+          ]
         );
-        if (inv.length > 0 && inv[0].current_quantity !== undefined) {
-          const currentQty = toBigInt(inv[0].current_quantity);
-          const newQty = currentQty - toBigInt(item.quantity);
-          await client.query(
-            `UPDATE inventory_items SET current_quantity = $1 WHERE id = $2 AND restaurant_id = $3`,
-            [newQty >= 0n ? newQty : 0n, item.productId, restaurantId]
+      }
+
+      for (const payment of input.payments) {
+        await client.query(
+          `INSERT INTO sale_payments
+             (id, sale_id, payment_method_id, amount_minor)
+           VALUES (gen_random_uuid(), $1, $2, $3)`,
+          [sale.id, payment.paymentMethodId, payment.amountMinor.toString()]
+        );
+      }
+
+      for (const [inventoryItemId, needed] of consumption) {
+        const { rows: updatedRows } = await client.query<{
+          name: string;
+          unit: string;
+          current_quantity: string;
+          average_cost_minor_per_unit: string;
+        }>(
+          `UPDATE inventory_items
+           SET current_quantity = current_quantity - $1,
+               updated_at = NOW()
+           WHERE id = $2 AND restaurant_id = $3 AND current_quantity >= $1
+           RETURNING name, unit, current_quantity, average_cost_minor_per_unit`,
+          [needed.toFixed(4), inventoryItemId, restaurantId]
+        );
+
+        const updated = updatedRows[0];
+        if (!updated) {
+          throw new BadRequestError(
+            "Stock changed while the sale was being recorded"
           );
         }
-      }
-    }
 
-    // 12. Create stock movements for consumption
-    for (const item of preparedItems) {
-      if (item.productId && item.quantity) {
-        const { rows: inv } = await client.query(
-          `SELECT id, current_quantity, name, unit, average_cost_minor_per_unit FROM inventory_items WHERE id = $1 AND restaurant_id = $2`,
-          [item.productId, restaurantId]
-        );
-        if (inv.length > 0 && inv[0].current_quantity !== undefined) {
-          const currentQty = toBigInt(inv[0].current_quantity);
-          const newQty = currentQty - toBigInt(item.quantity);
+        const averageCost = decimal(updated.average_cost_minor_per_unit);
 
-          await client.query(INSERT_STOCK_MOVEMENT, [
+        await client.query(
+          `INSERT INTO stock_movements
+             (id, restaurant_id, inventory_item_id, type, quantity_delta,
+              unit_cost_minor, value_minor, quantity_after, reference_type,
+              reference_id, reason, occurred_at, business_date,
+              recorded_by_user_id, created_at)
+           VALUES
+             (gen_random_uuid(), $1, $2, 'CONSUMPTION', $3,
+              $4, $5, $6, 'SALE',
+              $7, $8, $9, $10,
+              $11, NOW())`,
+          [
             restaurantId,
-            item.productId,
-            "CONSUMPTION",
-            item.quantity,
-            inv[0].average_cost_minor_per_unit || 0n,
-            toBigInt(item.quantity) * (inv[0].average_cost_minor_per_unit || 0n),
+            inventoryItemId,
+            needed.mul(-1n).toFixed(4),
+            averageCost.toFixed(6),
+            roundTo(needed.mul(averageCost), 0).toString(),
+            decimal(updated.current_quantity).toFixed(4),
+            sale.id,
+            `Sale ${transactionNumber}`,
             occurredAt,
             businessDate,
-            actorUserId,
-            "SALE",
-            saleId,
-            `Sale ${transactionNumber}`
-          ]);
-        }
+            actorUserId
+          ]
+        );
       }
+
+      await recordAudit(client, {
+        restaurantId,
+        actorUserId,
+        action: "SALE_RECORDED",
+        entityType: "Sale",
+        entityId: sale.id,
+        after: {
+          transactionNumber,
+          totalMinor: subtotal.toString(),
+          source: input.source
+        },
+        ...meta
+      });
+
+      return sale.id;
+    });
+  } catch (error) {
+    if (input.clientId && isUniqueViolation(error)) {
+      const { rows } = await query<SaleRow>(
+        `${SALE_SELECT} WHERE s.restaurant_id = $1 AND s.client_id = $2`,
+        [restaurantId, input.clientId]
+      );
+      if (rows[0]) {
+        const [serialized] = await hydrateSales(rows);
+        return serialized;
+      }
+      throw new ConflictError("The sale was already recorded");
     }
+    throw error;
+  }
 
-    // 13. Record audit
-    await client.query(
-      `INSERT INTO audit_log (restaurant_id, actor_user_id, action, entity_type, entity_id, before, after, ip, user_agent, created_at)
-       VALUES ($1, $2, 'SALE_RECORDED', 'Sale', $3, $4, $5, $6, $7, NOW())`,
-      [restaurantId, actorUserId, saleId,
-        JSON.stringify({ transactionNumber, totalMinor: subtotal.toString(), source: input.source }),
-        null,
-        JSON.stringify({ transactionNumber, totalMinor: subtotal.toString(), source: input.source }),
-        meta.ip, meta.userAgent]
-    );
-
-    return { success: true, sale: serializeSale(newSale) };
-  });
-
-  refreshLowStockNotifications(restaurantId);
-  return result;
+  await refreshLowStockNotifications(restaurantId);
+  return loadSale(restaurantId, saleId);
 }
 
 export async function voidSale(
@@ -422,69 +627,109 @@ export async function voidSale(
   reason: string,
   meta: AuditMeta
 ) {
-  const result = await transaction(async (client) => {
-    // 1. Get sale details
-    const { rows: sale } = await client.query(SALE_BY_ID, [saleId]);
-    if (sale.length === 0) throw new NotFoundError("Sale not found");
-    if (sale[0].status === "VOIDED") throw new BadRequestError("Sale already voided");
-
-    const saleData = sale[0];
-
-    // 2. Restock inventory - return consumed items
-    const { rows: stockMovements } = await client.query(GET_STOCK_MOVEMENTS, [restaurantId, saleId]);
-
-    for (const movement of stockMovements) {
-      // quantity_delta is negative (consumption), so we need to add it back (positive)
-      const restoredQty = toBigInt(movement.quantity_delta) * -1n; // Reverse the consumption
-      const itemId = movement.inventory_item_id;
-
-      // Update inventory quantity - add back the consumed amount
-      if (itemId) {
-        const { rows: inv } = await client.query(
-          `SELECT id, current_quantity, name FROM inventory_items WHERE id = $1 AND restaurant_id = $2`,
-          [itemId, restaurantId]
-        );
-        if (inv.length > 0 && inv[0].current_quantity !== undefined) {
-          const currentQty = toBigInt(inv[0].current_quantity);
-          await client.query(
-            `UPDATE inventory_items SET current_quantity = $1 WHERE id = $2 AND restaurant_id = $3`,
-            [currentQty + restoredQty, itemId, restaurantId]
-          );
-        }
-      }
-
-      // Create return stock movement (positive quantity_delta means return)
-      await client.query(INSERT_STOCK_MOVEMENT_RETURN, [
-        restaurantId,
-        itemId,
-        "RETURN",
-        restoredQty,  // positive = returning stock
-        movement.unit_cost_minor || 0n,
-        movement.value_minor || 0n,
-        new Date(),
-        saleData.business_date,
-        actorUserId,
-        "RETURN",
-        saleId,
-        `Sale ${saleData.transaction_number} voided`
-      ]);
-    }
-
-    // 3. Update sale status to VOIDED
-    await client.query(UPDATE_SALE_VOID, ["VOIDED", new Date(), reason, saleId]);
-
-    // 4. Record audit
-    await client.query(
-      `INSERT INTO audit_log (restaurant_id, actor_user_id, action, entity_type, entity_id, before, after, ip, user_agent, created_at)
-       VALUES ($1, $2, 'SALE_VOIDED', 'Sale', $3, $4, $5, $6, $7, NOW())`,
-      [restaurantId, actorUserId, saleId,
-        JSON.stringify({ status: saleData.status, totalMinor: toBigInt(saleData.total_minor).toString() }),
-        JSON.stringify({ status: "VOIDED", reason }),
-        meta.ip, meta.userAgent]
+  await transaction(async (client) => {
+    const { rows: saleRows } = await client.query<{
+      id: string;
+      transaction_number: string;
+      status: string;
+      total_minor: string;
+      business_date: string;
+    }>(
+      `SELECT id, transaction_number, status, total_minor, business_date
+       FROM sales WHERE id = $1 AND restaurant_id = $2`,
+      [saleId, restaurantId]
     );
 
-    return getSale(restaurantId, saleId);
+    const sale = saleRows[0];
+    if (!sale) {
+      throw new NotFoundError("The sale was not found");
+    }
+    if (sale.status === "VOIDED") {
+      throw new BadRequestError("This sale is already voided");
+    }
+
+    await assertDayOpen(client, restaurantId, sale.business_date);
+
+    const { rows: movements } = await client.query<{
+      id: string;
+      inventory_item_id: string;
+      quantity_delta: string;
+      unit_cost_minor: string;
+      value_minor: string;
+    }>(
+      `SELECT id, inventory_item_id, quantity_delta, unit_cost_minor, value_minor
+       FROM stock_movements
+       WHERE restaurant_id = $1 AND reference_type = 'SALE'
+         AND reference_id = $2 AND type = 'CONSUMPTION'`,
+      [restaurantId, saleId]
+    );
+
+    const occurredAt = new Date();
+
+    for (const movement of movements) {
+      const restored = decimal(movement.quantity_delta).mul(-1n);
+
+      const { rows: itemRows } = await client.query<{
+        current_quantity: string;
+      }>(
+        `UPDATE inventory_items
+         SET current_quantity = current_quantity + $1, updated_at = NOW()
+         WHERE id = $2
+         RETURNING current_quantity`,
+        [restored.toFixed(4), movement.inventory_item_id]
+      );
+
+      const item = itemRows[0];
+      if (!item) {
+        throw new NotFoundError("A recipe inventory item was not found");
+      }
+
+      await client.query(
+        `INSERT INTO stock_movements
+           (id, restaurant_id, inventory_item_id, type, quantity_delta,
+            unit_cost_minor, value_minor, quantity_after, reference_type,
+            reference_id, reason, occurred_at, business_date,
+            recorded_by_user_id, created_at)
+         VALUES
+           (gen_random_uuid(), $1, $2, 'RETURN', $3,
+            $4, $5, $6, 'RETURN',
+            $7, $8, $9, $10,
+            $11, NOW())`,
+        [
+          restaurantId,
+          movement.inventory_item_id,
+          restored.toFixed(4),
+          movement.unit_cost_minor,
+          movement.value_minor,
+          decimal(item.current_quantity).toFixed(4),
+          saleId,
+          `Sale ${sale.transaction_number} voided`,
+          occurredAt,
+          sale.business_date,
+          actorUserId
+        ]
+      );
+    }
+
+    await client.query(
+      `UPDATE sales
+       SET status = 'VOIDED', voided_at = $1, voided_by_user_id = $2,
+           void_reason = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [occurredAt, actorUserId, reason, saleId]
+    );
+
+    await recordAudit(client, {
+      restaurantId,
+      actorUserId,
+      action: "SALE_VOIDED",
+      entityType: "Sale",
+      entityId: saleId,
+      before: { status: sale.status, totalMinor: sale.total_minor.toString() },
+      after: { status: "VOIDED", reason },
+      ...meta
+    });
   });
 
-  return result;
+  return getSale(restaurantId, saleId);
 }

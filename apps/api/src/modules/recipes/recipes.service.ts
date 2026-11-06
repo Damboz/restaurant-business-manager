@@ -1,70 +1,96 @@
-import { Prisma } from "@prisma/client";
+import type { PoolClient } from "pg";
 import { recordAudit } from "../../lib/audit.js";
-import { decimal } from "../../lib/decimal.js";
+import { query, transaction } from "../../lib/db.js";
+import { decimal, roundTo } from "../../lib/decimal.js";
 import { BadRequestError, NotFoundError } from "../../lib/errors.js";
-import { prisma } from "../../lib/prisma.js";
 import { getActiveRecipeCost } from "../../lib/recipe-cost.js";
 
 type AuditMeta = { ip?: string; userAgent?: string };
 type IngredientInput = { inventoryItemId: string; quantity: string; unit: string };
 
 async function validateIngredients(
-  transaction: Prisma.TransactionClient,
+  client: PoolClient,
   restaurantId: string,
   ingredients: IngredientInput[]
 ): Promise<void> {
   const ids = ingredients.map((item) => item.inventoryItemId);
+
   if (new Set(ids).size !== ids.length) {
     throw new BadRequestError("Each inventory item may only appear once");
   }
 
-  const found = await transaction.inventoryItem.findMany({
-    where: { restaurantId, id: { in: ids }, isActive: true },
-    select: { id: true }
-  });
+  const { rows } = await client.query<{ id: string }>(
+    `SELECT id FROM inventory_items
+     WHERE restaurant_id = $1 AND id = ANY($2::uuid[]) AND is_active = true`,
+    [restaurantId, ids]
+  );
 
-  if (found.length !== ids.length) {
+  if (rows.length !== ids.length) {
     throw new NotFoundError("One or more inventory items were not found");
   }
 }
 
-async function serializeRecipe(recipeId: string) {
-  const recipe = await prisma.recipe.findUniqueOrThrow({
-    where: { id: recipeId },
-    include: {
-      product: { select: { id: true, name: true, sellingPriceMinor: true } },
-      ingredients: {
-        include: {
-          inventoryItem: {
-            select: {
-              id: true,
-              name: true,
-              unit: true,
-              averageCostMinorPerUnit: true
-            }
-          }
-        }
-      }
-    }
-  });
+type RecipeHeaderRow = {
+  id: string;
+  product_id: string;
+  product_name: string;
+  selling_price_minor: string;
+  version: number;
+  yield_quantity: string;
+  is_active: boolean;
+  notes: string | null;
+};
 
-  const lines = recipe.ingredients.map((ingredient) => {
-    const perUnit = decimal(ingredient.quantity).div(recipe.yieldQuantity);
-    const cost = BigInt(
-      perUnit
-        .mul(ingredient.inventoryItem.averageCostMinorPerUnit)
-        .toDecimalPlaces(0, Prisma.Decimal.ROUND_HALF_UP)
-        .toFixed(0)
+type RecipeIngredientRow = {
+  id: string;
+  inventory_item_id: string;
+  quantity: string;
+  unit: string;
+  name: string;
+  average_cost_minor_per_unit: string;
+};
+
+async function serializeRecipe(recipeId: string) {
+  const { rows: recipes } = await query<RecipeHeaderRow>(
+    `SELECT r.id, r.product_id, p.name AS product_name, p.selling_price_minor,
+            r.version, r.yield_quantity, r.is_active, r.notes
+     FROM recipes r
+     JOIN products p ON p.id = r.product_id
+     WHERE r.id = $1`,
+    [recipeId]
+  );
+  const recipe = recipes[0];
+
+  if (!recipe) {
+    throw new NotFoundError("The recipe was not found");
+  }
+
+  const { rows: ingredients } = await query<RecipeIngredientRow>(
+    `SELECT ri.id, ri.inventory_item_id, ri.quantity, ri.unit,
+            ii.name, ii.average_cost_minor_per_unit
+     FROM recipe_ingredients ri
+     JOIN inventory_items ii ON ii.id = ri.inventory_item_id
+     WHERE ri.recipe_id = $1`,
+    [recipeId]
+  );
+
+  const yieldQuantity = decimal(recipe.yield_quantity);
+  const lines = ingredients.map((ingredient) => {
+    const perUnit = decimal(ingredient.quantity).div(yieldQuantity);
+    const cost = roundTo(
+      perUnit.mul(ingredient.average_cost_minor_per_unit),
+      0
     );
 
     return {
       id: ingredient.id,
-      inventoryItemId: ingredient.inventoryItemId,
-      name: ingredient.inventoryItem.name,
-      quantity: ingredient.quantity.toFixed(4),
+      inventoryItemId: ingredient.inventory_item_id,
+      name: ingredient.name,
+      quantity: decimal(ingredient.quantity).toFixed(4),
       unit: ingredient.unit,
-      averageCostMinorPerUnit:
-        ingredient.inventoryItem.averageCostMinorPerUnit.toFixed(6),
+      averageCostMinorPerUnit: decimal(
+        ingredient.average_cost_minor_per_unit
+      ).toFixed(6),
       costMinor: cost.toString(),
       quantityPerYieldUnit: perUnit.toFixed(4)
     };
@@ -74,36 +100,49 @@ async function serializeRecipe(recipeId: string) {
 
   return {
     id: recipe.id,
-    productId: recipe.productId,
-    productName: recipe.product.name,
-    sellingPriceMinor: recipe.product.sellingPriceMinor.toString(),
+    productId: recipe.product_id,
+    productName: recipe.product_name,
+    sellingPriceMinor: recipe.selling_price_minor,
     version: recipe.version,
-    yieldQuantity: recipe.yieldQuantity.toFixed(4),
-    isActive: recipe.isActive,
+    yieldQuantity: yieldQuantity.toFixed(4),
+    isActive: recipe.is_active,
     notes: recipe.notes,
     costPerYieldUnitMinor: costMinor.toString(),
-    grossMarginMinor: (recipe.product.sellingPriceMinor - costMinor).toString(),
+    grossMarginMinor: (
+      BigInt(recipe.selling_price_minor) - costMinor
+    ).toString(),
     ingredients: lines
   };
 }
 
 export async function listRecipes(restaurantId: string, productId?: string) {
-  const recipes = await prisma.recipe.findMany({
-    where: { restaurantId, ...(productId ? { productId } : {}) },
-    orderBy: [{ productId: "asc" }, { version: "desc" }],
-    select: { id: true }
-  });
+  const params: unknown[] = [restaurantId];
+  let where = "WHERE restaurant_id = $1";
 
-  return Promise.all(recipes.map((recipe) => serializeRecipe(recipe.id)));
+  if (productId) {
+    params.push(productId);
+    where += ` AND product_id = $${params.length}`;
+  }
+
+  const { rows } = await query<{ id: string }>(
+    `SELECT id FROM recipes ${where} ORDER BY product_id ASC, version DESC`,
+    params
+  );
+
+  return Promise.all(rows.map((recipe) => serializeRecipe(recipe.id)));
 }
 
 export async function getRecipe(restaurantId: string, recipeId: string) {
-  const recipe = await prisma.recipe.findFirst({
-    where: { id: recipeId, restaurantId },
-    select: { id: true }
-  });
-  if (!recipe) throw new NotFoundError("The recipe was not found");
-  return serializeRecipe(recipe.id);
+  const { rows } = await query<{ id: string }>(
+    `SELECT id FROM recipes WHERE id = $1 AND restaurant_id = $2`,
+    [recipeId, restaurantId]
+  );
+
+  if (!rows[0]) {
+    throw new NotFoundError("The recipe was not found");
+  }
+
+  return serializeRecipe(recipeId);
 }
 
 export async function createRecipe(
@@ -117,58 +156,79 @@ export async function createRecipe(
   },
   meta: AuditMeta
 ) {
-  const recipeId = await prisma.$transaction(async (transaction) => {
-    const product = await transaction.product.findFirst({
-      where: { id: input.productId, restaurantId },
-      select: { id: true }
-    });
-    if (!product) throw new NotFoundError("The product was not found");
+  const recipeId = await transaction(async (client) => {
+    const { rows: products } = await client.query<{ id: string }>(
+      `SELECT id FROM products WHERE id = $1 AND restaurant_id = $2`,
+      [input.productId, restaurantId]
+    );
+
+    if (!products[0]) {
+      throw new NotFoundError("The product was not found");
+    }
+
     if (decimal(input.yieldQuantity).lte(0)) {
       throw new BadRequestError("Yield quantity must be greater than zero");
     }
-    await validateIngredients(transaction, restaurantId, input.ingredients);
 
-    const latest = await transaction.recipe.aggregate({
-      where: { productId: input.productId },
-      _max: { version: true }
-    });
+    await validateIngredients(client, restaurantId, input.ingredients);
 
-    await transaction.recipe.updateMany({
-      where: { productId: input.productId, isActive: true },
-      data: { isActive: false }
-    });
+    const { rows: versions } = await client.query<{ max: number | null }>(
+      `SELECT MAX(version) AS max FROM recipes WHERE product_id = $1`,
+      [input.productId]
+    );
+    const version = (versions[0]?.max ?? 0) + 1;
 
-    const recipe = await transaction.recipe.create({
-      data: {
+    await client.query(
+      `UPDATE recipes SET is_active = false, updated_at = NOW()
+       WHERE product_id = $1 AND is_active = true`,
+      [input.productId]
+    );
+
+    const { rows: recipes } = await client.query<{ id: string }>(
+      `INSERT INTO recipes
+         (id, restaurant_id, product_id, version, yield_quantity, is_active,
+          notes, created_by_user_id, created_at, updated_at)
+       VALUES
+         (gen_random_uuid(), $1, $2, $3, $4, true, $5, $6, NOW(), NOW())
+       RETURNING id`,
+      [
         restaurantId,
-        productId: input.productId,
-        version: (latest._max.version ?? 0) + 1,
-        yieldQuantity: decimal(input.yieldQuantity),
-        notes: input.notes,
-        createdByUserId: actorUserId,
-        ingredients: {
-          create: input.ingredients.map((ingredient) => ({
-            inventoryItemId: ingredient.inventoryItemId,
-            quantity: decimal(ingredient.quantity),
-            unit: ingredient.unit
-          }))
-        }
-      },
-      select: { id: true }
-    });
+        input.productId,
+        version,
+        decimal(input.yieldQuantity).toFixed(4),
+        input.notes ?? null,
+        actorUserId
+      ]
+    );
+    const recipe = recipes[0]!;
 
-    await transaction.product.update({
-      where: { id: input.productId },
-      data: { isRecipeBased: true }
-    });
+    for (const ingredient of input.ingredients) {
+      await client.query(
+        `INSERT INTO recipe_ingredients
+           (id, recipe_id, inventory_item_id, quantity, unit)
+         VALUES
+           (gen_random_uuid(), $1, $2, $3, $4)`,
+        [
+          recipe.id,
+          ingredient.inventoryItemId,
+          decimal(ingredient.quantity).toFixed(4),
+          ingredient.unit
+        ]
+      );
+    }
 
-    await recordAudit(transaction, {
+    await client.query(
+      `UPDATE products SET is_recipe_based = true, updated_at = NOW() WHERE id = $1`,
+      [input.productId]
+    );
+
+    await recordAudit(client, {
       restaurantId,
       actorUserId,
       action: "RECIPE_CREATED",
       entityType: "Recipe",
       entityId: recipe.id,
-      after: { productId: input.productId, version: recipe.id },
+      after: { productId: input.productId, version },
       ...meta
     });
 
@@ -190,50 +250,88 @@ export async function updateRecipe(
   },
   meta: AuditMeta
 ) {
-  await prisma.$transaction(async (transaction) => {
-    const recipe = await transaction.recipe.findFirst({
-      where: { id: recipeId, restaurantId },
-      select: { id: true, productId: true, isActive: true }
-    });
-    if (!recipe) throw new NotFoundError("The recipe was not found");
+  await transaction(async (client) => {
+    const { rows: recipes } = await client.query<{
+      id: string;
+      product_id: string;
+      is_active: boolean;
+    }>(
+      `SELECT id, product_id, is_active FROM recipes
+       WHERE id = $1 AND restaurant_id = $2`,
+      [recipeId, restaurantId]
+    );
+    const recipe = recipes[0];
+
+    if (!recipe) {
+      throw new NotFoundError("The recipe was not found");
+    }
 
     if (input.yieldQuantity !== undefined && decimal(input.yieldQuantity).lte(0)) {
       throw new BadRequestError("Yield quantity must be greater than zero");
     }
+
     if (input.ingredients) {
-      await validateIngredients(transaction, restaurantId, input.ingredients);
+      await validateIngredients(client, restaurantId, input.ingredients);
     }
 
     if (input.isActive) {
-      await transaction.recipe.updateMany({
-        where: { productId: recipe.productId, id: { not: recipeId } },
-        data: { isActive: false }
-      });
+      await client.query(
+        `UPDATE recipes SET is_active = false, updated_at = NOW()
+         WHERE product_id = $1 AND id <> $2`,
+        [recipe.product_id, recipeId]
+      );
     }
 
-    await transaction.recipe.update({
-      where: { id: recipeId },
-      data: {
-        yieldQuantity:
-          input.yieldQuantity === undefined ? undefined : decimal(input.yieldQuantity),
-        notes: input.notes,
-        isActive: input.isActive,
-        ...(input.ingredients
-          ? {
-              ingredients: {
-                deleteMany: {},
-                create: input.ingredients.map((ingredient) => ({
-                  inventoryItemId: ingredient.inventoryItemId,
-                  quantity: decimal(ingredient.quantity),
-                  unit: ingredient.unit
-                }))
-              }
-            }
-          : {})
-      }
-    });
+    const assignments: string[] = [];
+    const params: unknown[] = [];
 
-    await recordAudit(transaction, {
+    if (input.yieldQuantity !== undefined) {
+      params.push(decimal(input.yieldQuantity).toFixed(4));
+      assignments.push(`yield_quantity = $${params.length}`);
+    }
+
+    if (input.notes !== undefined) {
+      params.push(input.notes);
+      assignments.push(`notes = $${params.length}`);
+    }
+
+    if (input.isActive !== undefined) {
+      params.push(input.isActive);
+      assignments.push(`is_active = $${params.length}`);
+    }
+
+    if (assignments.length > 0) {
+      params.push(recipeId);
+      await client.query(
+        `UPDATE recipes
+         SET ${assignments.join(", ")}, updated_at = NOW()
+         WHERE id = $${params.length}`,
+        params
+      );
+    }
+
+    if (input.ingredients) {
+      await client.query(`DELETE FROM recipe_ingredients WHERE recipe_id = $1`, [
+        recipeId
+      ]);
+
+      for (const ingredient of input.ingredients) {
+        await client.query(
+          `INSERT INTO recipe_ingredients
+             (id, recipe_id, inventory_item_id, quantity, unit)
+           VALUES
+             (gen_random_uuid(), $1, $2, $3, $4)`,
+          [
+            recipeId,
+            ingredient.inventoryItemId,
+            decimal(ingredient.quantity).toFixed(4),
+            ingredient.unit
+          ]
+        );
+      }
+    }
+
+    await recordAudit(client, {
       restaurantId,
       actorUserId,
       action: "RECIPE_UPDATED",
@@ -248,16 +346,22 @@ export async function updateRecipe(
 }
 
 export async function getProductRecipeCost(restaurantId: string, productId: string) {
-  const product = await prisma.product.findFirst({
-    where: { id: productId, restaurantId },
-    select: { id: true }
-  });
-  if (!product) throw new NotFoundError("The product was not found");
-
-  const cost = await prisma.$transaction((transaction) =>
-    getActiveRecipeCost(transaction, restaurantId, productId)
+  const { rows } = await query<{ id: string }>(
+    `SELECT id FROM products WHERE id = $1 AND restaurant_id = $2`,
+    [productId, restaurantId]
   );
 
-  if (!cost) throw new NotFoundError("This product has no active recipe");
+  if (!rows[0]) {
+    throw new NotFoundError("The product was not found");
+  }
+
+  const cost = await transaction((client) =>
+    getActiveRecipeCost(client, restaurantId, productId)
+  );
+
+  if (!cost) {
+    throw new NotFoundError("This product has no active recipe");
+  }
+
   return cost;
 }

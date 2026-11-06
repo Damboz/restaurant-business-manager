@@ -1,6 +1,7 @@
-import type { Prisma } from "@prisma/client";
+import type { PoolClient } from "pg";
+import { pool } from "./db.js";
 
-type AuditClient = Pick<Prisma.TransactionClient, "auditLog">;
+type Queryable = Pick<PoolClient, "query">;
 
 export type AuditEntry = {
   restaurantId?: string | null;
@@ -8,27 +9,33 @@ export type AuditEntry = {
   action: string;
   entityType: string;
   entityId?: string | null;
-  before?: Prisma.InputJsonValue;
-  after?: Prisma.InputJsonValue;
+  before?: unknown;
+  after?: unknown;
   ip?: string;
   userAgent?: string;
 };
 
 export async function recordAudit(
-  client: AuditClient,
+  client: Queryable | typeof pool | null,
   entry: AuditEntry
 ): Promise<void> {
-  await client.auditLog.create({
-    data: {
-      restaurantId: entry.restaurantId ?? null,
-      actorUserId: entry.actorUserId ?? null,
-      action: entry.action,
-      entityType: entry.entityType,
-      entityId: entry.entityId ?? null,
-      ...(entry.before === undefined ? {} : { before: entry.before }),
-      ...(entry.after === undefined ? {} : { after: entry.after }),
-      ip: entry.ip,
-      userAgent: entry.userAgent
-    }
-  });
+  const db = client ?? pool;
+
+  await db.query(
+    `INSERT INTO audit_logs
+       (id, restaurant_id, actor_user_id, action, entity_type, entity_id, before, after, ip, user_agent, created_at)
+     VALUES
+       (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+    [
+      entry.restaurantId ?? null,
+      entry.actorUserId ?? null,
+      entry.action,
+      entry.entityType,
+      entry.entityId ?? null,
+      entry.before === undefined ? null : JSON.stringify(entry.before),
+      entry.after === undefined ? null : JSON.stringify(entry.after),
+      entry.ip ?? null,
+      entry.userAgent ?? null
+    ]
+  );
 }

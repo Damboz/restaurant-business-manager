@@ -16,7 +16,7 @@ const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().min(1).max(65_535).default(4000),
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
-  DIRECT_URL: z.string().min(1, "DIRECT_URL must not be empty").optional(),
+  DATABASE_SSL: booleanFromString.default(false),
   CORS_ORIGINS: z
     .string()
     .default("http://localhost:8081,http://localhost:19006")
@@ -50,7 +50,6 @@ export const env = {
   isTest: parsed.data.NODE_ENV === "test",
   port: parsed.data.PORT,
   databaseUrl: parsed.data.DATABASE_URL,
-  directUrl: parsed.data.DIRECT_URL,
   corsOrigins: parsed.data.CORS_ORIGINS,
   accessTokenSecret: parsed.data.ACCESS_TOKEN_SECRET,
   refreshTokenPepper: parsed.data.REFRESH_TOKEN_PEPPER,

@@ -1,44 +1,70 @@
-import { Prisma } from "@prisma/client";
-import { recordAudit } from "../../lib/audit.js";
+﻿import { recordAudit } from "../../lib/audit.js";
 import {
   dateOnlyToDate,
   dateToDateOnly,
   todayInTimeZone
 } from "../../lib/business-date.js";
+import { query, transaction } from "../../lib/db.js";
 import { BadRequestError, NotFoundError } from "../../lib/errors.js";
-import { prisma } from "../../lib/prisma.js";
 import { summaryForRange } from "../reports/reports.service.js";
 
 type AuditMeta = { ip?: string; userAgent?: string };
 
+type ClosingRow = {
+  id: string;
+  business_date: string;
+  status: string;
+  cash_sales_minor: string;
+  mobile_money_sales_minor: string;
+  bank_sales_minor: string;
+  other_sales_minor: string;
+  manual_sales_minor: string;
+  total_sales_minor: string;
+  cogs_minor: string;
+  gross_profit_minor: string;
+  operating_expenses_minor: string;
+  net_profit_minor: string;
+  transaction_count: number;
+  closed_at: Date;
+  reopened_at: Date | null;
+  reopen_reason: string | null;
+};
+
 async function restaurantTimezone(restaurantId: string): Promise<string> {
-  const restaurant = await prisma.restaurant.findUnique({
-    where: { id: restaurantId },
-    select: { timezone: true }
-  });
-  if (!restaurant) throw new NotFoundError("The restaurant was not found");
-  return restaurant.timezone;
+  const { rows } = await query<{ timezone: string }>(
+    "SELECT timezone FROM restaurants WHERE id = $1",
+    [restaurantId]
+  );
+  if (!rows[0]) {
+    throw new NotFoundError("The restaurant was not found");
+  }
+  return rows[0].timezone;
 }
 
 export async function previewClosing(restaurantId: string, businessDate?: string) {
   const timezone = await restaurantTimezone(restaurantId);
   const date = businessDate ?? todayInTimeZone(timezone);
   const summary = await summaryForRange(restaurantId, date, date);
-  const closing = await prisma.dailyClosing.findUnique({
-    where: {
-      restaurantId_businessDate: {
-        restaurantId,
-        businessDate: dateOnlyToDate(date)
-      }
-    }
-  });
+
+  const { rows } = await query<{
+    status: string;
+    closed_at: Date | null;
+    reopened_at: Date | null;
+    reopen_reason: string | null;
+  }>(
+    `SELECT status, closed_at, reopened_at, reopen_reason
+     FROM daily_closings
+     WHERE restaurant_id = $1 AND business_date = $2`,
+    [restaurantId, dateToDateOnly(dateOnlyToDate(date))]
+  );
+  const closing = rows[0];
 
   return {
     businessDate: date,
     status: closing?.status ?? "OPEN",
-    closedAt: closing?.closedAt?.toISOString() ?? null,
-    reopenedAt: closing?.reopenedAt?.toISOString() ?? null,
-    reopenReason: closing?.reopenReason ?? null,
+    closedAt: closing?.closed_at ? closing.closed_at.toISOString() : null,
+    reopenedAt: closing?.reopened_at ? closing.reopened_at.toISOString() : null,
+    reopenReason: closing?.reopen_reason ?? null,
     summary
   };
 }
@@ -68,40 +94,79 @@ export async function closeDay(
   meta: AuditMeta
 ) {
   const summary = await summaryForRange(restaurantId, businessDate, businessDate);
-  const date = dateOnlyToDate(businessDate);
+  const date = dateToDateOnly(dateOnlyToDate(businessDate));
   const totals = closingData(summary);
 
-  const closing = await prisma.$transaction(async (transaction) => {
-    const existing = await transaction.dailyClosing.findUnique({
-      where: { restaurantId_businessDate: { restaurantId, businessDate: date } }
-    });
+  const closing = await transaction(async (client) => {
+    const { rows: existingRows } = await client.query<{ status: string }>(
+      `SELECT status FROM daily_closings
+       WHERE restaurant_id = $1 AND business_date = $2`,
+      [restaurantId, date]
+    );
 
-    if (existing?.status === "CLOSED") {
+    if (existingRows[0]?.status === "CLOSED") {
       throw new BadRequestError("This business day is already closed");
     }
 
-    const saved = await transaction.dailyClosing.upsert({
-      where: { restaurantId_businessDate: { restaurantId, businessDate: date } },
-      create: {
+    const { rows } = await client.query<ClosingRow>(
+      `INSERT INTO daily_closings
+         (id, restaurant_id, business_date, status, cash_sales_minor,
+          mobile_money_sales_minor, bank_sales_minor, other_sales_minor,
+          manual_sales_minor, total_sales_minor, cogs_minor, gross_profit_minor,
+          operating_expenses_minor, net_profit_minor, transaction_count,
+          closed_by_user_id, closed_at, reopened_by_user_id, reopened_at,
+          reopen_reason, created_at, updated_at)
+       VALUES
+         (gen_random_uuid(), $1, $2, 'CLOSED', $3,
+          $4, $5, $6,
+          $7, $8, $9, $10,
+          $11, $12, $13,
+          $14, NOW(), NULL, NULL,
+          NULL, NOW(), NOW())
+       ON CONFLICT (restaurant_id, business_date) DO UPDATE
+         SET status = 'CLOSED',
+             cash_sales_minor = EXCLUDED.cash_sales_minor,
+             mobile_money_sales_minor = EXCLUDED.mobile_money_sales_minor,
+             bank_sales_minor = EXCLUDED.bank_sales_minor,
+             other_sales_minor = EXCLUDED.other_sales_minor,
+             manual_sales_minor = EXCLUDED.manual_sales_minor,
+             total_sales_minor = EXCLUDED.total_sales_minor,
+             cogs_minor = EXCLUDED.cogs_minor,
+             gross_profit_minor = EXCLUDED.gross_profit_minor,
+             operating_expenses_minor = EXCLUDED.operating_expenses_minor,
+             net_profit_minor = EXCLUDED.net_profit_minor,
+             transaction_count = EXCLUDED.transaction_count,
+             closed_by_user_id = EXCLUDED.closed_by_user_id,
+             closed_at = NOW(),
+             reopened_by_user_id = NULL,
+             reopened_at = NULL,
+             reopen_reason = NULL,
+             updated_at = NOW()
+       RETURNING *`,
+      [
         restaurantId,
-        businessDate: date,
-        status: "CLOSED",
-        ...totals,
-        closedByUserId: actorUserId,
-        closedAt: new Date()
-      },
-      update: {
-        status: "CLOSED",
-        ...totals,
-        closedByUserId: actorUserId,
-        closedAt: new Date(),
-        reopenedByUserId: null,
-        reopenedAt: null,
-        reopenReason: null
-      }
-    });
+        date,
+        totals.cashSalesMinor.toString(),
+        totals.mobileMoneySalesMinor.toString(),
+        totals.bankSalesMinor.toString(),
+        totals.otherSalesMinor.toString(),
+        totals.manualSalesMinor.toString(),
+        totals.totalSalesMinor.toString(),
+        totals.cogsMinor.toString(),
+        totals.grossProfitMinor.toString(),
+        totals.operatingExpensesMinor.toString(),
+        totals.netProfitMinor.toString(),
+        totals.transactionCount,
+        actorUserId
+      ]
+    );
 
-    await recordAudit(transaction, {
+    const saved = rows[0];
+    if (!saved) {
+      throw new BadRequestError("The business day could not be closed");
+    }
+
+    await recordAudit(client, {
       restaurantId,
       actorUserId,
       action: "DAY_CLOSED",
@@ -135,28 +200,41 @@ export async function reopenDay(
   reason: string,
   meta: AuditMeta
 ) {
-  const date = dateOnlyToDate(businessDate);
+  const date = dateToDateOnly(dateOnlyToDate(businessDate));
 
-  const closing = await prisma.$transaction(async (transaction) => {
-    const existing = await transaction.dailyClosing.findUnique({
-      where: { restaurantId_businessDate: { restaurantId, businessDate: date } }
-    });
-    if (!existing) throw new NotFoundError("This business day has not been closed");
+  const closing = await transaction(async (client) => {
+    const { rows: existingRows } = await client.query<{
+      id: string;
+      status: string;
+    }>(
+      `SELECT id, status FROM daily_closings
+       WHERE restaurant_id = $1 AND business_date = $2`,
+      [restaurantId, date]
+    );
+
+    const existing = existingRows[0];
+    if (!existing) {
+      throw new NotFoundError("This business day has not been closed");
+    }
     if (existing.status !== "CLOSED") {
       throw new BadRequestError("This business day is already open");
     }
 
-    const reopened = await transaction.dailyClosing.update({
-      where: { id: existing.id },
-      data: {
-        status: "OPEN",
-        reopenedByUserId: actorUserId,
-        reopenedAt: new Date(),
-        reopenReason: reason
-      }
-    });
+    const { rows } = await client.query<ClosingRow>(
+      `UPDATE daily_closings
+       SET status = 'OPEN', reopened_by_user_id = $1, reopened_at = NOW(),
+           reopen_reason = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [actorUserId, reason, existing.id]
+    );
 
-    await recordAudit(transaction, {
+    const reopened = rows[0];
+    if (!reopened) {
+      throw new NotFoundError("This business day has not been closed");
+    }
+
+    await recordAudit(client, {
       restaurantId,
       actorUserId,
       action: "DAY_REOPENED",
@@ -173,43 +251,25 @@ export async function reopenDay(
   return serializeClosing(closing);
 }
 
-function serializeClosing(closing: {
-  id: string;
-  businessDate: Date;
-  status: string;
-  cashSalesMinor: bigint;
-  mobileMoneySalesMinor: bigint;
-  bankSalesMinor: bigint;
-  otherSalesMinor: bigint;
-  manualSalesMinor: bigint;
-  totalSalesMinor: bigint;
-  cogsMinor: bigint;
-  grossProfitMinor: bigint;
-  operatingExpensesMinor: bigint;
-  netProfitMinor: bigint;
-  transactionCount: number;
-  closedAt: Date;
-  reopenedAt: Date | null;
-  reopenReason: string | null;
-}) {
+function serializeClosing(closing: ClosingRow) {
   return {
     id: closing.id,
-    businessDate: dateToDateOnly(closing.businessDate),
+    businessDate: dateToDateOnly(closing.business_date),
     status: closing.status,
-    cashSalesMinor: closing.cashSalesMinor.toString(),
-    mobileMoneySalesMinor: closing.mobileMoneySalesMinor.toString(),
-    bankSalesMinor: closing.bankSalesMinor.toString(),
-    otherSalesMinor: closing.otherSalesMinor.toString(),
-    manualSalesMinor: closing.manualSalesMinor.toString(),
-    totalSalesMinor: closing.totalSalesMinor.toString(),
-    cogsMinor: closing.cogsMinor.toString(),
-    grossProfitMinor: closing.grossProfitMinor.toString(),
-    operatingExpensesMinor: closing.operatingExpensesMinor.toString(),
-    netProfitMinor: closing.netProfitMinor.toString(),
-    transactionCount: closing.transactionCount,
-    closedAt: closing.closedAt.toISOString(),
-    reopenedAt: closing.reopenedAt?.toISOString() ?? null,
-    reopenReason: closing.reopenReason
+    cashSalesMinor: closing.cash_sales_minor.toString(),
+    mobileMoneySalesMinor: closing.mobile_money_sales_minor.toString(),
+    bankSalesMinor: closing.bank_sales_minor.toString(),
+    otherSalesMinor: closing.other_sales_minor.toString(),
+    manualSalesMinor: closing.manual_sales_minor.toString(),
+    totalSalesMinor: closing.total_sales_minor.toString(),
+    cogsMinor: closing.cogs_minor.toString(),
+    grossProfitMinor: closing.gross_profit_minor.toString(),
+    operatingExpensesMinor: closing.operating_expenses_minor.toString(),
+    netProfitMinor: closing.net_profit_minor.toString(),
+    transactionCount: Number(closing.transaction_count),
+    closedAt: closing.closed_at.toISOString(),
+    reopenedAt: closing.reopened_at ? closing.reopened_at.toISOString() : null,
+    reopenReason: closing.reopen_reason
   };
 }
 
@@ -220,21 +280,26 @@ async function createClosingNotification(
   netProfitMinor: bigint
 ): Promise<void> {
   try {
-    await prisma.notification.create({
-      data: {
+    await query(
+      `INSERT INTO notifications
+         (id, restaurant_id, user_id, type, severity, title_key, body_key,
+          params, dedupe_key, created_at)
+       VALUES
+         (gen_random_uuid(), $1, $2, 'DAILY_SUMMARY', 'INFO',
+          'notifications.dailySummary.title',
+          'notifications.dailySummary.body',
+          $3::jsonb, $4, NOW())
+       ON CONFLICT (user_id, dedupe_key) DO NOTHING`,
+      [
         restaurantId,
         userId,
-        type: "DAILY_SUMMARY",
-        severity: "INFO",
-        titleKey: "notifications.dailySummary.title",
-        bodyKey: "notifications.dailySummary.body",
-        params: {
+        JSON.stringify({
           date: businessDate,
           netProfitMinor: netProfitMinor.toString()
-        },
-        dedupeKey: `daily-summary:${businessDate}`
-      }
-    });
+        }),
+        `daily-summary:${businessDate}`
+      ]
+    );
   } catch {
     // A duplicate or notification failure must not reopen a successful close.
   }
@@ -242,7 +307,7 @@ async function createClosingNotification(
 
 export async function listClosings(
   restaurantId: string,
-  query: {
+  filters: {
     page: number;
     pageSize: number;
     startDate?: string;
@@ -250,33 +315,43 @@ export async function listClosings(
     status?: "OPEN" | "CLOSED";
   }
 ) {
-  const where: Prisma.DailyClosingWhereInput = {
-    restaurantId,
-    ...(query.status ? { status: query.status } : {}),
-    ...(query.startDate || query.endDate
-      ? {
-          businessDate: {
-            ...(query.startDate ? { gte: dateOnlyToDate(query.startDate) } : {}),
-            ...(query.endDate ? { lte: dateOnlyToDate(query.endDate) } : {})
-          }
-        }
-      : {})
-  };
+  const conditions = ["restaurant_id = $1"];
+  const params: unknown[] = [restaurantId];
 
-  const [items, total] = await Promise.all([
-    prisma.dailyClosing.findMany({
-      where,
-      orderBy: { businessDate: "desc" },
-      skip: (query.page - 1) * query.pageSize,
-      take: query.pageSize
-    }),
-    prisma.dailyClosing.count({ where })
+  if (filters.status) {
+    params.push(filters.status);
+    conditions.push(`status = $${params.length}`);
+  }
+  if (filters.startDate) {
+    params.push(dateToDateOnly(dateOnlyToDate(filters.startDate)));
+    conditions.push(`business_date >= $${params.length}`);
+  }
+  if (filters.endDate) {
+    params.push(dateToDateOnly(dateOnlyToDate(filters.endDate)));
+    conditions.push(`business_date <= $${params.length}`);
+  }
+
+  const where = `WHERE ${conditions.join(" AND ")}`;
+  const offset = (filters.page - 1) * filters.pageSize;
+
+  const [{ rows }, { rows: countRows }] = await Promise.all([
+    query<ClosingRow>(
+      `SELECT * FROM daily_closings ${where}
+       ORDER BY business_date DESC LIMIT $${params.length + 1} OFFSET $${
+        params.length + 2
+      }`,
+      [...params, filters.pageSize, offset]
+    ),
+    query<{ total: number }>(
+      `SELECT COUNT(*)::int AS total FROM daily_closings ${where}`,
+      params
+    )
   ]);
 
   return {
-    items: items.map(serializeClosing),
-    total,
-    page: query.page,
-    pageSize: query.pageSize
+    items: rows.map(serializeClosing),
+    total: Number(countRows[0]?.total ?? 0),
+    page: filters.page,
+    pageSize: filters.pageSize
   };
 }

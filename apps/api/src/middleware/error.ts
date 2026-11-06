@@ -1,5 +1,4 @@
 import type { ErrorRequestHandler, RequestHandler } from "express";
-import { Prisma } from "@prisma/client";
 import { ZodError } from "zod";
 import { AppError } from "../lib/errors.js";
 import { env } from "../config/env.js";
@@ -10,6 +9,11 @@ type ErrorBody = {
     message: string;
     details?: unknown;
   };
+};
+
+type PostgresError = {
+  code?: string;
+  constraint?: string;
 };
 
 function sendError(
@@ -30,6 +34,10 @@ function sendError(
   }
 
   return { statusCode, body };
+}
+
+function isPostgresError(error: unknown): error is PostgresError {
+  return typeof error === "object" && error !== null && "code" in error;
 }
 
 export const notFoundHandler: RequestHandler = (request, response) => {
@@ -70,15 +78,25 @@ export const errorHandler: ErrorRequestHandler = (error, _request, response, nex
     return;
   }
 
-  if (error instanceof Prisma.PrismaClientKnownRequestError) {
-    if (error.code === "P2002") {
+  if (isPostgresError(error)) {
+    if (error.code === "23505") {
       const payload = sendError(409, "CONFLICT", "A record with these details already exists");
       response.status(payload.statusCode).json(payload.body);
       return;
     }
 
-    if (error.code === "P2025") {
-      const payload = sendError(404, "NOT_FOUND", "The requested record was not found");
+    if (error.code === "23503") {
+      const payload = sendError(
+        400,
+        "BAD_REQUEST",
+        "A referenced record does not exist or is still in use"
+      );
+      response.status(payload.statusCode).json(payload.body);
+      return;
+    }
+
+    if (error.code === "22P02" || error.code === "23514") {
+      const payload = sendError(400, "BAD_REQUEST", "The request contains invalid values");
       response.status(payload.statusCode).json(payload.body);
       return;
     }

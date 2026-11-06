@@ -11,17 +11,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy",
-    "prisma:seed": "prisma db seed",
-    "postinstall": "prisma generate"
-  },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
+    "db:schema": "node scripts/apply-schema.mjs",
+    "db:seed": "node scripts/seed.mjs",
+    "db:setup": "npm run db:schema && npm run db:seed"
   },
   "dependencies": {
-    "@prisma/client": "6.19.3",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^18.0.9",
@@ -39,7 +33,6 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.10.0",
     "@types/supertest": "^6.0.3",
-    "prisma": "6.19.3",
     "supertest": "^7.3.1",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",

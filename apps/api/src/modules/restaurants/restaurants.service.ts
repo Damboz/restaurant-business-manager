@@ -1,7 +1,10 @@
-import { pool, query } from "../../lib/db.js";
-import { resolvePermissions } from "../../lib/permissions.js";
+import { query } from "../../lib/db.js";
+import {
+  resolvePermissions,
+  type PermissionEffect
+} from "../../lib/permissions.js";
 
-type RestaurantAccess = {
+export type RestaurantAccess = {
   membershipId: string;
   joinedAt: string;
   restaurant: {
@@ -18,60 +21,83 @@ type RestaurantAccess = {
   permissions: string[];
 };
 
+type MembershipRow = {
+  id: string;
+  joined_at: Date;
+  role_id: string;
+  role_key: string;
+  role_name: string;
+  restaurant_id: string;
+  name: string;
+  currency: string;
+  timezone: string;
+  restaurant_status: string;
+};
+
 export async function listMyRestaurants(
   userId: string
 ): Promise<RestaurantAccess[]> {
-  const { rows: memberships } = await pool.query(`
-    SELECT mu.id, mu.joined_at as joinedAt, r.*,
-           rl.key as role_key, rl.name as role_name,
-           json_agg(DISTINCT p.key) as permissions
-    FROM restaurant_users mu
-    JOIN restaurants r ON mu.restaurant_id = r.id
-    JOIN roles rl ON mu.role_id = rl.id
-    LEFT JOIN role_permissions rp ON rl.id = rp.role_id
-    LEFT JOIN permissions p ON rp.permission_id = p.id
-    WHERE mu.user_id = $1 AND mu.status = 'ACTIVE' AND r.status = 'ACTIVE'
-    GROUP BY mu.id, mu.joined_at, r.id, rl.key, rl.name, r.status
-  `, [userId]);
+  const { rows: memberships } = await query<MembershipRow>(
+    `SELECT ru.id, ru.joined_at, ru.role_id,
+            ro.key AS role_key, ro.name AS role_name,
+            r.id AS restaurant_id, r.name, r.currency, r.timezone,
+            r.status AS restaurant_status
+     FROM restaurant_users ru
+     JOIN restaurants r ON r.id = ru.restaurant_id
+     JOIN roles ro ON ro.id = ru.role_id
+     WHERE ru.user_id = $1 AND ru.status = 'ACTIVE' AND r.status = 'ACTIVE'
+     ORDER BY ru.joined_at ASC`,
+    [userId]
+  );
+
+  if (memberships.length === 0) {
+    return [];
+  }
+
+  const roleIds = [...new Set(memberships.map((membership) => membership.role_id))];
+  const membershipIds = memberships.map((membership) => membership.id);
+
+  const [{ rows: rolePermissions }, { rows: overrides }] = await Promise.all([
+    query<{ role_id: string; key: string }>(
+      `SELECT rp.role_id, p.key
+       FROM role_permissions rp
+       JOIN permissions p ON p.id = rp.permission_id
+       WHERE rp.role_id = ANY($1::uuid[])`,
+      [roleIds]
+    ),
+    query<{
+      restaurant_user_id: string;
+      effect: PermissionEffect;
+      key: string;
+    }>(
+      `SELECT rup.restaurant_user_id, rup.effect, p.key
+       FROM restaurant_user_permissions rup
+       JOIN permissions p ON p.id = rup.permission_id
+       WHERE rup.restaurant_user_id = ANY($1::uuid[])`,
+      [membershipIds]
+    )
+  ]);
+
+  const permissionsByRole = new Map<string, string[]>();
+  for (const permission of rolePermissions) {
+    const list = permissionsByRole.get(permission.role_id) ?? [];
+    list.push(permission.key);
+    permissionsByRole.set(permission.role_id, list);
+  }
+
+  const overridesByMembership = new Map<
+    string,
+    Array<{ key: string; effect: PermissionEffect }>
+  >();
+  for (const override of overrides) {
+    const list = overridesByMembership.get(override.restaurant_user_id) ?? [];
+    list.push({ key: override.key, effect: override.effect });
+    overridesByMembership.set(override.restaurant_user_id, list);
+  }
 
   return memberships.map((membership) => ({
     membershipId: membership.id,
-    joinedAt: membership.joinedAt.toISOString(),
-    restaurant: {
-      id: membership.id,  // Fix: should be r.id, but we're grouping - let me adjust
-      name: membership.name,
-      currency: membership.currency,
-      timezone: membership.timezone,
-      status: membership.status
-    },
-    role: {
-      key: membership.role_key,
-      name: membership.role_name
-    },
-    permissions: resolvePermissions(
-      // This needs the permission keys - let me restructure
-      []
-    )
-  }));
-}
-
-// Actually, let me do a simpler version that matches the original Prisma behavior
-
-export async function listMyRestaurantsSimple(
-  userId: string
-): Promise<any[]> {
-  const { rows: memberships } = await pool.query(`
-    SELECT mu.id as membership_id, mu.joined_at as joined_at, r.id as restaurant_id, r.name, r.currency, r.timezone, r.status as restaurant_status,
-           rl.key as role_key, rl.name as role_name
-    FROM restaurant_users mu
-    JOIN restaurants r ON mu.restaurant_id = r.id
-    JOIN roles rl ON mu.role_id = rl.id
-    WHERE mu.user_id = $1 AND mu.status = 'ACTIVE' AND r.status = 'ACTIVE'
-  `, [userId]);
-
-  return memberships.map((membership) => ({
-    membershipId: membership.membership_id,
-    joinedAt: membership.joined_at,
+    joinedAt: membership.joined_at.toISOString(),
     restaurant: {
       id: membership.restaurant_id,
       name: membership.name,
@@ -82,6 +108,10 @@ export async function listMyRestaurantsSimple(
     role: {
       key: membership.role_key,
       name: membership.role_name
-    }
+    },
+    permissions: resolvePermissions(
+      permissionsByRole.get(membership.role_id) ?? [],
+      overridesByMembership.get(membership.id) ?? []
+    )
   }));
 }

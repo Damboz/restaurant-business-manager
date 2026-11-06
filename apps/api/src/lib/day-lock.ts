@@ -1,23 +1,22 @@
-import type { Prisma } from "@prisma/client";
+import type { PoolClient } from "pg";
 import { BadRequestError } from "./errors.js";
 import { dateToDateOnly } from "./business-date.js";
 
 export async function assertDayOpen(
-  transaction: Prisma.TransactionClient,
+  client: PoolClient,
   restaurantId: string,
-  businessDate: Date
+  businessDate: Date | string
 ): Promise<void> {
-  const closing = await transaction.dailyClosing.findUnique({
-    where: {
-      restaurantId_businessDate: { restaurantId, businessDate }
-    },
-    select: { status: true }
-  });
+  const date = dateToDateOnly(businessDate);
+  const { rows } = await client.query<{ status: string }>(
+    `SELECT status FROM daily_closings WHERE restaurant_id = $1 AND business_date = $2`,
+    [restaurantId, date]
+  );
 
-  if (closing?.status === "CLOSED") {
-    throw new BadRequestError(
-      `The business day ${dateToDateOnly(businessDate)} is closed`,
-      { field: "occurredAt", businessDate: dateToDateOnly(businessDate) }
-    );
+  if (rows[0]?.status === "CLOSED") {
+    throw new BadRequestError(`The business day ${date} is closed`, {
+      field: "occurredAt",
+      businessDate: date
+    });
   }
 }
