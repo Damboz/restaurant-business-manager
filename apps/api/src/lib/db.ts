@@ -17,6 +17,7 @@ if (!connectionString) {
 types.setTypeParser(1082, (value: string) => value);
 
 const requiresSsl =
+  process.env.DATABASE_SSL === "true" ||
   /sslmode=(require|verify-ca|verify-full)/i.test(connectionString) ||
   /[?&]ssl=true/i.test(connectionString);
 
