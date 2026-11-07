@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "dev:api": "npm run dev --workspace @rbm/api",
+    "dev:mobile": "npm start --workspace @rbm/mobile",
     "build": "npm run build:shared && npm run build:api",
     "build:api": "npm run build --workspace @rbm/api",
     "build:shared": "npm run build --workspace @rbm/shared",
