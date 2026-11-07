@@ -40,6 +40,17 @@
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {
+        "asyncRoutes": {
+          "web": true
+        }
+      },
+      "eas": {
+        "projectId": "917f1b23-d18b-4400-9653-3db50e01063f"
+      }
+    },
+    "owner": "dambogeorge"
   }
 }

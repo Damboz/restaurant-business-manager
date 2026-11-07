@@ -4,10 +4,13 @@
   "private": true,
   "main": "expo-router/entry",
   "scripts": {
+    "postinstall": "cd ../.. && npm run build:shared",
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
+    "build:android": "eas build --platform android --profile preview",
+    "build:ios": "eas build --platform ios --profile preview",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
