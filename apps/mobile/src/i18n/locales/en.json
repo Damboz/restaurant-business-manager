@@ -4,8 +4,9 @@
     "tagline": "Manage your restaurant business with confidence"
   },
   "nav": {
-    "dashboard": "Dashboard",
+    "dashboard": "Home",
     "sales": "Sales",
+    "purchases": "Purchases",
     "expenses": "Expenses",
     "inventory": "Inventory",
     "stock": "Stock",
@@ -98,6 +99,9 @@
     "lowStock": "Low stock",
     "quickActions": "Quick actions",
     "recordSale": "Record sale",
+    "addPurchase": "Record purchase",
+    "profit": "Profit",
+    "loss": "Loss",
     "addExpense": "Add expense",
     "addStock": "Add stock",
     "viewReports": "View reports",
@@ -222,8 +226,10 @@
     "saveVersion": "Save version"
   },
   "purchases": {
-    "title": "Stock purchases",
-    "newPurchase": "New purchase",
+    "title": "Purchases",
+    "newPurchase": "Record purchase",
+    "description": "What did you buy?",
+    "descriptionPlaceholder": "e.g. meat, cooking oil, transport",
     "item": "Item",
     "quantity": "Quantity",
     "unitPrice": "Unit price ({{currency}})",
@@ -236,7 +242,7 @@
     "addItem": "Add item",
     "save": "Save purchase",
     "recordedBy": "Recorded by",
-    "empty": "No purchases for this period"
+    "empty": "No purchases recorded this month"
   },
   "closings": {
     "title": "Daily closings",

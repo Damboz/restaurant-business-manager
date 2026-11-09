@@ -1,73 +1,74 @@
-import { useFocusEffect, useRouter } from 'expo-router';
+import { useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
-import { formatMoney } from '@rbm/shared';
+import { formatMoney, parseMoneyToMinor } from '@rbm/shared';
 
 import { Text, View } from '@/components/Themed';
 import { AppButton } from '@/src/components/AppButton';
 import { Chip } from '@/src/components/Chip';
 import { FormField } from '@/src/components/FormField';
 import { Screen } from '@/src/components/Screen';
-import { Card, EmptyText, ErrorBanner, LoadingBlock, Pill, Row } from '@/src/components/ui';
+import { Card, EmptyText, ErrorBanner, LoadingBlock, Row } from '@/src/components/ui';
 import {
+  createSale,
+  getSettings,
   listSales,
-  voidSale,
   type Sale,
+  type SettingsData,
 } from '@/src/api/business';
 import { useAuth } from '@/src/auth/AuthProvider';
 import { useRestaurantId } from '@/src/hooks/useRestaurantId';
-import { startOfMonth, startOfWeek, todayDateOnly } from '@/src/utils/date';
-
-type Period = 'today' | 'week' | 'month';
-
-const PERIODS: Period[] = ['today', 'week', 'month'];
-
-function rangeFor(period: Period): { startDate?: string; endDate?: string } {
-  const today = todayDateOnly();
-
-  if (period === 'week') {
-    return { startDate: startOfWeek(today), endDate: today };
-  }
-
-  if (period === 'month') {
-    return { startDate: startOfMonth(today), endDate: today };
-  }
-
-  return { startDate: today, endDate: today };
-}
+import {
+  isDateOnly,
+  occurredAtForDate,
+  startOfMonth,
+  todayDateOnly,
+} from '@/src/utils/date';
 
 export default function SalesScreen() {
   const { t } = useTranslation();
-  const router = useRouter();
   const restaurantId = useRestaurantId();
-  const { activeMembership, hasPermission } = useAuth();
+  const { activeMembership } = useAuth();
   const currency = activeMembership?.restaurant.currency ?? 'MWK';
-  const canCreate = hasPermission('sales.create');
-  const canVoid = hasPermission('sales.void');
   const [sales, setSales] = useState<Sale[]>([]);
-  const [period, setPeriod] = useState<Period>('today');
+  const [settings, setSettings] = useState<SettingsData | null>(null);
+  const [amount, setAmount] = useState('');
+  const [date, setDate] = useState(todayDateOnly());
+  const [paymentMethodId, setPaymentMethodId] = useState('');
+  const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [voidingId, setVoidingId] = useState<string | null>(null);
-  const [voidReason, setVoidReason] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!restaurantId) return;
-
     setLoading(true);
     setError(null);
 
     try {
-      const page = await listSales(restaurantId, rangeFor(period));
-      setSales(page.items);
+      const today = todayDateOnly();
+      const [salePage, settingsData] = await Promise.all([
+        listSales(restaurantId, {
+          startDate: startOfMonth(today),
+          endDate: today,
+          status: 'COMPLETED',
+        }),
+        getSettings(restaurantId),
+      ]);
+      setSales(salePage.items);
+      setSettings(settingsData);
+      setPaymentMethodId((current) => {
+        if (current) return current;
+        const method = settingsData.paymentMethods.find((item) => item.isActive);
+        return method?.id ?? '';
+      });
     } catch (loadError) {
       setError((loadError as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [restaurantId, period]);
+  }, [restaurantId]);
 
   useFocusEffect(
     useCallback(() => {
@@ -75,147 +76,106 @@ export default function SalesScreen() {
     }, [load])
   );
 
-  async function handleVoid(sale: Sale) {
-    if (!restaurantId || !voidReason.trim()) return;
+  const paymentMethods =
+    settings?.paymentMethods.filter((method) => method.isActive) ?? [];
+  const amountMinor = amount.trim() ? parseMoneyToMinor(amount, currency) : 0n;
+  const canSubmit =
+    Boolean(paymentMethodId) && isDateOnly(date) && amountMinor > 0n;
+  const total = sales.reduce(
+    (sum, sale) => sum + BigInt(sale.totalMinor),
+    0n
+  );
 
+  async function submit() {
+    if (!restaurantId || !canSubmit) return;
     setSaving(true);
     setError(null);
 
     try {
-      await voidSale(restaurantId, sale.id, voidReason.trim());
-      setVoidingId(null);
-      setVoidReason('');
+      await createSale(restaurantId, {
+        occurredAt: occurredAtForDate(date),
+        source: 'MANUAL',
+        notes: notes.trim() || undefined,
+        items: [],
+        payments: [{ paymentMethodId, amountMinor: amountMinor.toString() }],
+      });
+      setAmount('');
+      setNotes('');
       await load();
-    } catch (voidError) {
-      setError((voidError as Error).message);
+    } catch (saveError) {
+      setError((saveError as Error).message);
     } finally {
       setSaving(false);
     }
   }
 
-  const total = sales
-    .filter((sale) => sale.status === 'COMPLETED')
-    .reduce((sum, sale) => sum + BigInt(sale.totalMinor), 0n);
-
   return (
     <Screen>
-      <Text style={styles.title}>{t('sales.title')}</Text>
+      <Text style={styles.title}>{t('nav.sales')}</Text>
 
-      <View style={styles.chips}>
-        {PERIODS.map((value) => (
-          <Chip
-            key={value}
-            label={t(`common.${value}`)}
-            selected={period === value}
-            onPress={() => setPeriod(value)}
-          />
-        ))}
-      </View>
-
-      {canCreate ? (
-        <AppButton
-          title={t('sales.newSale')}
-          onPress={() => router.push('/sales/new')}
+      <Card>
+        <FormField
+          label={`${t('common.amount')} (${currency})`}
+          value={amount}
+          onChangeText={setAmount}
+          keyboardType="decimal-pad"
+          placeholder="0"
         />
-      ) : null}
+        <FormField
+          label={`${t('common.date')} (YYYY-MM-DD)`}
+          value={date}
+          onChangeText={setDate}
+          autoCapitalize="none"
+        />
 
-      {error ? <ErrorBanner message={error} /> : null}
+        <Text style={styles.fieldLabel}>{t('sales.paymentMethod')}</Text>
+        <View style={styles.chips}>
+          {paymentMethods.map((method) => (
+            <Chip
+              key={method.id}
+              label={method.name}
+              selected={method.id === paymentMethodId}
+              onPress={() => setPaymentMethodId(method.id)}
+            />
+          ))}
+        </View>
+
+        <FormField
+          label={`${t('common.notes')} (${t('common.optional')})`}
+          value={notes}
+          onChangeText={setNotes}
+        />
+
+        {error ? <ErrorBanner message={error} /> : null}
+
+        <AppButton
+          title={t('sales.save')}
+          loading={saving}
+          disabled={!canSubmit}
+          onPress={() => void submit()}
+        />
+      </Card>
+
+      <Card>
+        <Row label={t('reports.sales')} value={formatMoney(total, currency)} />
+        <Row label={t('reports.transactions')} value={String(sales.length)} />
+      </Card>
+
       {loading ? <LoadingBlock label={t('common.loading')} /> : null}
-
-      {!loading ? (
-        <Card>
-          <Row label={t('sales.total')} value={formatMoney(total, currency)} />
-          <Row label={t('reports.transactions')} value={String(sales.length)} />
-        </Card>
-      ) : null}
-
       {!loading && sales.length === 0 ? (
         <EmptyText>{t('sales.empty')}</EmptyText>
       ) : null}
 
       {sales.map((sale) => (
         <Card key={sale.id}>
-          <View style={styles.cardHeader}>
-            <View style={styles.cardTitleArea}>
-              <Text style={styles.name}>{sale.transactionNumber}</Text>
-              <Text style={styles.meta}>
-                {new Date(sale.occurredAt).toLocaleString()}
-              </Text>
-            </View>
-            <Pill
-              label={
-                sale.status === 'COMPLETED'
-                  ? t('sales.completed')
-                  : t('sales.voided')
-              }
-              tone={sale.status === 'COMPLETED' ? 'positive' : 'danger'}
-            />
-          </View>
-
           <Row
-            label={t('common.total')}
+            label={new Date(sale.occurredAt).toLocaleDateString()}
             value={formatMoney(BigInt(sale.totalMinor), currency)}
           />
-          <Row
-            label={t('sales.source')}
-            value={
-              sale.source === 'MANUAL'
-                ? t('sales.manual')
-                : t('sales.itemized')
-            }
-          />
-          <Row
-            label={t('sales.paymentMethod')}
-            value={
-              sale.payments.map((payment) => payment.paymentMethodName).join(', ') ||
-              t('common.none')
-            }
-          />
-          <Text style={styles.detail}>
-            {sale.items.length > 0
-              ? sale.items
-                  .map((item) => `${item.productName} x${item.quantity}`)
-                  .join(', ')
-              : t('sales.manualSale')}
+          <Text style={styles.meta}>
+            {sale.payments.map((payment) => payment.paymentMethodName).join(', ')}
           </Text>
-
-          {canVoid && sale.status === 'COMPLETED' ? (
-            voidingId === sale.id ? (
-              <View style={styles.voidForm}>
-                <FormField
-                  label={t('sales.voidReason')}
-                  value={voidReason}
-                  onChangeText={setVoidReason}
-                />
-                <View style={styles.voidActions}>
-                  <AppButton
-                    title={t('sales.confirmVoid')}
-                    variant="danger"
-                    loading={saving}
-                    disabled={!voidReason.trim()}
-                    onPress={() => void handleVoid(sale)}
-                  />
-                  <AppButton
-                    title={t('common.cancel')}
-                    variant="ghost"
-                    onPress={() => {
-                      setVoidingId(null);
-                      setVoidReason('');
-                    }}
-                  />
-                </View>
-              </View>
-            ) : (
-              <AppButton
-                title={t('sales.void')}
-                variant="ghost"
-                onPress={() => {
-                  setVoidingId(sale.id);
-                  setVoidReason('');
-                }}
-              />
-            )
-          ) : null}
+          {sale.notes ? <Text style={styles.meta}>{sale.notes}</Text> : null}
         </Card>
       ))}
     </Screen>
@@ -228,39 +188,20 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     marginBottom: 16,
   },
+  fieldLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
   chips: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
-    marginBottom: 16,
-  },
-  cardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 12,
-    marginBottom: 8,
-  },
-  cardTitleArea: {
-    flex: 1,
-  },
-  name: {
-    fontSize: 17,
-    fontWeight: '700',
+    marginBottom: 14,
   },
   meta: {
-    marginTop: 4,
     fontSize: 13,
     opacity: 0.7,
-  },
-  detail: {
-    marginTop: 8,
-    fontSize: 13,
-    opacity: 0.7,
-  },
-  voidForm: {
-    marginTop: 12,
-  },
-  voidActions: {
-    gap: 8,
+    marginTop: 2,
   },
 });

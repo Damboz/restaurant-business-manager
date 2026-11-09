@@ -118,6 +118,22 @@ export default function SettingsScreen() {
           />
         ) : null}
 
+        {hasPermission('closings.view') ? (
+          <AppButton
+            title={t('closings.title')}
+            variant="secondary"
+            onPress={() => router.push('/closings')}
+          />
+        ) : null}
+
+        {hasPermission('settings.manage') ? (
+          <AppButton
+            title={t('settings.restaurantSettings')}
+            variant="secondary"
+            onPress={() => router.push('/restaurant-settings')}
+          />
+        ) : null}
+
         <AppButton
           title={t('auth.changePassword')}
           variant="secondary"

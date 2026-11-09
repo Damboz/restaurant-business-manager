@@ -4,8 +4,9 @@
     "tagline": "Yang'anirani bizinesi yanu ya resitora mosatekeseka"
   },
   "nav": {
-    "dashboard": "Chidule cha Bizinesi",
+    "dashboard": "Kunyumba",
     "sales": "Zogulitsa",
+    "purchases": "Zogula",
     "expenses": "Ndalama Zogwiritsidwa Ntchito",
     "inventory": "Katundu Wosungidwa",
     "stock": "Katundu",
@@ -98,6 +99,9 @@
     "lowStock": "Katundu wotsala pang'ono",
     "quickActions": "Zochita mwachangu",
     "recordSale": "Lembani zogulitsa",
+    "addPurchase": "Lembani zogula",
+    "profit": "Phindu",
+    "loss": "Kutayika",
     "addExpense": "Onjezani ndalama zogwiritsidwa ntchito",
     "addStock": "Onjezani katundu",
     "viewReports": "Onani malipoti",
@@ -222,8 +226,10 @@
     "saveVersion": "Sungani mtundu"
   },
   "purchases": {
-    "title": "Zogula katundu",
-    "newPurchase": "Kugula kwatsopano",
+    "title": "Zogula",
+    "newPurchase": "Lembani zogula",
+    "description": "Munagula chiyani?",
+    "descriptionPlaceholder": "mwachitsanzo: nyama, mafuta, mayendedwe",
     "item": "Chinthu",
     "quantity": "Kuchuluka",
     "unitPrice": "Mtengo wa chigawo ({{currency}})",
@@ -236,7 +242,7 @@
     "addItem": "Onjezani chinthu",
     "save": "Sungani kugula",
     "recordedBy": "Analemba",
-    "empty": "Palibe zogula panthawi ino"
+    "empty": "Palibe zogula zolembedwa mwezi uno"
   },
   "closings": {
     "title": "Kutseka kwa tsiku",

@@ -38,7 +38,7 @@ export default function TabLayout() {
           title: t('nav.dashboard'),
           tabBarIcon: ({ color }) => (
             <SymbolView
-              name={{ ios: 'chart.bar.fill', android: 'bar_chart', web: 'bar_chart' }}
+              name={{ ios: 'house.fill', android: 'home', web: 'home' }}
               tintColor={color}
               size={26}
             />
@@ -59,12 +59,12 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
-        name="stock"
+        name="purchases"
         options={{
-          title: t('nav.stock'),
+          title: t('nav.purchases'),
           tabBarIcon: ({ color }) => (
             <SymbolView
-              name={{ ios: 'shippingbox.fill', android: 'inventory_2', web: 'inventory_2' }}
+              name={{ ios: 'bag.fill', android: 'shopping_bag', web: 'shopping_bag' }}
               tintColor={color}
               size={26}
             />
