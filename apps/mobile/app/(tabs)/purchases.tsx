@@ -1,6 +1,6 @@
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
-import { StyleSheet } from 'react-native';
+import { Alert, StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { formatMoney, parseMoneyToMinor } from '@rbm/shared';
 
@@ -14,6 +14,7 @@ import {
   createExpense,
   getSettings,
   listExpenses,
+  voidExpense,
   type Expense,
   type SettingsData,
 } from '@/src/api/business';
@@ -29,7 +30,7 @@ import {
 export default function PurchasesScreen() {
   const { t } = useTranslation();
   const restaurantId = useRestaurantId();
-  const { activeMembership } = useAuth();
+  const { activeMembership, hasPermission } = useAuth();
   const currency = activeMembership?.restaurant.currency ?? 'MWK';
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [settings, setSettings] = useState<SettingsData | null>(null);
@@ -41,6 +42,7 @@ export default function PurchasesScreen() {
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -95,6 +97,7 @@ export default function PurchasesScreen() {
     (sum, expense) => sum + BigInt(expense.totalMinor),
     0n
   );
+  const canVoid = hasPermission('expenses.void');
 
   async function submit() {
     if (!restaurantId || !canSubmit) return;
@@ -124,6 +127,32 @@ export default function PurchasesScreen() {
       setError((saveError as Error).message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  function confirmVoid(expense: Expense) {
+    Alert.alert(t('expenses.void'), t('purchases.deleteConfirm'), [
+      { text: t('common.cancel'), style: 'cancel' },
+      {
+        text: t('common.delete'),
+        style: 'destructive',
+        onPress: () => void removeExpense(expense.id),
+      },
+    ]);
+  }
+
+  async function removeExpense(expenseId: string) {
+    if (!restaurantId) return;
+    setRemovingId(expenseId);
+    setError(null);
+
+    try {
+      await voidExpense(restaurantId, expenseId, t('purchases.deleteReason'));
+      await load();
+    } catch (removeError) {
+      setError((removeError as Error).message);
+    } finally {
+      setRemovingId(null);
     }
   }
 
@@ -212,10 +241,19 @@ export default function PurchasesScreen() {
             value={formatMoney(BigInt(expense.totalMinor), currency)}
           />
           <Text style={styles.meta}>
-            {new Date(expense.occurredAt).toLocaleDateString()} ·{' '}
+            {new Date(expense.occurredAt).toLocaleDateString()} -{' '}
             {expense.items[0]?.categoryName ?? ''}
           </Text>
           {expense.notes ? <Text style={styles.meta}>{expense.notes}</Text> : null}
+          {canVoid ? (
+            <AppButton
+              title={t('common.delete')}
+              variant="danger"
+              loading={removingId === expense.id}
+              onPress={() => confirmVoid(expense)}
+              style={styles.deleteButton}
+            />
+          ) : null}
         </Card>
       ))}
     </Screen>
@@ -243,5 +281,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
     opacity: 0.7,
     marginTop: 2,
+  },
+  deleteButton: {
+    marginTop: 10,
   },
 });

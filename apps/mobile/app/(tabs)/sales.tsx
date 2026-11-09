@@ -1,6 +1,6 @@
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
-import { StyleSheet } from 'react-native';
+import { Alert, StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { formatMoney, parseMoneyToMinor } from '@rbm/shared';
 
@@ -14,6 +14,7 @@ import {
   createSale,
   getSettings,
   listSales,
+  voidSale,
   type Sale,
   type SettingsData,
 } from '@/src/api/business';
@@ -29,7 +30,7 @@ import {
 export default function SalesScreen() {
   const { t } = useTranslation();
   const restaurantId = useRestaurantId();
-  const { activeMembership } = useAuth();
+  const { activeMembership, hasPermission } = useAuth();
   const currency = activeMembership?.restaurant.currency ?? 'MWK';
   const [sales, setSales] = useState<Sale[]>([]);
   const [settings, setSettings] = useState<SettingsData | null>(null);
@@ -39,6 +40,7 @@ export default function SalesScreen() {
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -85,6 +87,7 @@ export default function SalesScreen() {
     (sum, sale) => sum + BigInt(sale.totalMinor),
     0n
   );
+  const canVoid = hasPermission('sales.void');
 
   async function submit() {
     if (!restaurantId || !canSubmit) return;
@@ -106,6 +109,32 @@ export default function SalesScreen() {
       setError((saveError as Error).message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  function confirmVoid(sale: Sale) {
+    Alert.alert(t('sales.void'), t('sales.deleteConfirm'), [
+      { text: t('common.cancel'), style: 'cancel' },
+      {
+        text: t('common.delete'),
+        style: 'destructive',
+        onPress: () => void removeSale(sale.id),
+      },
+    ]);
+  }
+
+  async function removeSale(saleId: string) {
+    if (!restaurantId) return;
+    setRemovingId(saleId);
+    setError(null);
+
+    try {
+      await voidSale(restaurantId, saleId, t('sales.deleteReason'));
+      await load();
+    } catch (removeError) {
+      setError((removeError as Error).message);
+    } finally {
+      setRemovingId(null);
     }
   }
 
@@ -176,6 +205,15 @@ export default function SalesScreen() {
             {sale.payments.map((payment) => payment.paymentMethodName).join(', ')}
           </Text>
           {sale.notes ? <Text style={styles.meta}>{sale.notes}</Text> : null}
+          {canVoid ? (
+            <AppButton
+              title={t('common.delete')}
+              variant="danger"
+              loading={removingId === sale.id}
+              onPress={() => confirmVoid(sale)}
+              style={styles.deleteButton}
+            />
+          ) : null}
         </Card>
       ))}
     </Screen>
@@ -203,5 +241,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
     opacity: 0.7,
     marginTop: 2,
+  },
+  deleteButton: {
+    marginTop: 10,
   },
 });

@@ -144,6 +144,8 @@
     "completed": "Completed",
     "voided": "Voided",
     "transactionNumber": "Transaction",
+    "deleteConfirm": "Delete this sale? This cannot be undone.",
+    "deleteReason": "Recorded by mistake",
     "empty": "No sales recorded for this period"
   },
   "expenses": {
@@ -242,6 +244,8 @@
     "addItem": "Add item",
     "save": "Save purchase",
     "recordedBy": "Recorded by",
+    "deleteConfirm": "Delete this purchase? This cannot be undone.",
+    "deleteReason": "Recorded by mistake",
     "empty": "No purchases recorded this month"
   },
   "closings": {

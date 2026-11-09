@@ -144,6 +144,8 @@
     "completed": "Zatha",
     "voided": "Zachotsedwa",
     "transactionNumber": "Chochitika",
+    "deleteConfirm": "Chotsani zogulitsa izi? Izi sizingabwezedwe.",
+    "deleteReason": "Zinalembedwa molakwika",
     "empty": "Palibe zogulitsa zolembedwa panthawi ino"
   },
   "expenses": {
@@ -242,6 +244,8 @@
     "addItem": "Onjezani chinthu",
     "save": "Sungani kugula",
     "recordedBy": "Analemba",
+    "deleteConfirm": "Chotsani zogula izi? Izi sizingabwezedwe.",
+    "deleteReason": "Zinalembedwa molakwika",
     "empty": "Palibe zogula zolembedwa mwezi uno"
   },
   "closings": {
