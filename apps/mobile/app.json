@@ -36,6 +36,14 @@
           "resizeMode": "contain",
           "backgroundColor": "#0F5132"
         }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "useLegacyPackaging": true
+          }
+        }
       ]
     ],
     "experiments": {
