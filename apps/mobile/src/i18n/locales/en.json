@@ -80,7 +80,7 @@
     "alreadyAccount": "Already have an account?",
     "temporaryPasswordNotice": "You are using a temporary password. Change it now to secure your account.",
     "changePassword": "Change password",
-    "changePasswordHint": "Use at least 10 characters with letters and numbers.",
+    "changePasswordHint": "Use at least 6 characters with letters and numbers.",
     "confirmPassword": "Confirm new password",
     "passwordsDoNotMatch": "The passwords do not match"
   },
@@ -276,6 +276,9 @@
     "custom": "Custom report",
     "exportPdf": "Export PDF",
     "exportExcel": "Export Excel",
+    "generatingPdf": "Generating PDF...",
+    "exportFailed": "The report could not be generated.",
+    "generatedAt": "Generated",
     "revenue": "Revenue",
     "sales": "Sales",
     "expenses": "Expenses",

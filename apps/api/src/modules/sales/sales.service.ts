@@ -7,6 +7,7 @@ import {
 } from "../../lib/business-date.js";
 import { assertDayOpen } from "../../lib/day-lock.js";
 import { query, transaction } from "../../lib/db.js";
+import { refreshClosedDaySnapshot } from "../closings/closings.service.js";
 import { decimal, roundTo, type Decimal } from "../../lib/decimal.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../../lib/errors.js";
 import { getActiveRecipeCost } from "../../lib/recipe-cost.js";
@@ -627,6 +628,8 @@ export async function voidSale(
   reason: string,
   meta: AuditMeta
 ) {
+  let voidedBusinessDate: string | null = null;
+
   await transaction(async (client) => {
     const { rows: saleRows } = await client.query<{
       id: string;
@@ -648,7 +651,7 @@ export async function voidSale(
       throw new BadRequestError("This sale is already voided");
     }
 
-    await assertDayOpen(client, restaurantId, sale.business_date);
+    voidedBusinessDate = sale.business_date;
 
     const { rows: movements } = await client.query<{
       id: string;
@@ -730,6 +733,10 @@ export async function voidSale(
       ...meta
     });
   });
+
+  if (voidedBusinessDate) {
+    await refreshClosedDaySnapshot(restaurantId, voidedBusinessDate);
+  }
 
   return getSale(restaurantId, saleId);
 }

@@ -87,6 +87,51 @@ function closingData(summary: Awaited<ReturnType<typeof summaryForRange>>) {
   };
 }
 
+export async function refreshClosedDaySnapshot(
+  restaurantId: string,
+  businessDate: string
+) {
+  const date = dateToDateOnly(dateOnlyToDate(businessDate));
+
+  const { rows } = await query<{ status: string }>(
+    `SELECT status FROM daily_closings
+     WHERE restaurant_id = $1 AND business_date = $2`,
+    [restaurantId, date]
+  );
+  if (rows[0]?.status !== "CLOSED") {
+    return;
+  }
+
+  const summary = await summaryForRange(restaurantId, date, date);
+  const totals = closingData(summary);
+
+  await query(
+    `UPDATE daily_closings
+     SET cash_sales_minor = $3, mobile_money_sales_minor = $4,
+         bank_sales_minor = $5, other_sales_minor = $6,
+         manual_sales_minor = $7, total_sales_minor = $8,
+         cogs_minor = $9, gross_profit_minor = $10,
+         operating_expenses_minor = $11, net_profit_minor = $12,
+         transaction_count = $13, updated_at = NOW()
+     WHERE restaurant_id = $1 AND business_date = $2 AND status = 'CLOSED'`,
+    [
+      restaurantId,
+      date,
+      totals.cashSalesMinor.toString(),
+      totals.mobileMoneySalesMinor.toString(),
+      totals.bankSalesMinor.toString(),
+      totals.otherSalesMinor.toString(),
+      totals.manualSalesMinor.toString(),
+      totals.totalSalesMinor.toString(),
+      totals.cogsMinor.toString(),
+      totals.grossProfitMinor.toString(),
+      totals.operatingExpensesMinor.toString(),
+      totals.netProfitMinor.toString(),
+      totals.transactionCount
+    ]
+  );
+}
+
 export async function closeDay(
   restaurantId: string,
   actorUserId: string,

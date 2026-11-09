@@ -73,10 +73,21 @@ describe("user management schemas", () => {
       fullName: "Staff Member",
       phone: "0991234567",
       roleKey: "CASHIER",
-      password: "short1"
+      password: "shrt1"
     });
 
     expect(result.success).toBe(false);
+  });
+
+  it("accepts a temporary password of the minimum policy length", () => {
+    const result = createMemberSchema.safeParse({
+      fullName: "Staff Member",
+      phone: "0991234567",
+      roleKey: "CASHIER",
+      password: "short1"
+    });
+
+    expect(result.success).toBe(true);
   });
 
   it("rejects duplicate permission overrides", () => {

@@ -80,7 +80,7 @@
     "alreadyAccount": "Muli kale ndi akaunti?",
     "temporaryPasswordNotice": "Mukugwiritsa ntchito mawu achinsinsi osakhalitsa. Asinthireni tsopano kuti muteteze akaunti yanu.",
     "changePassword": "Sinthani mawu achinsinsi",
-    "changePasswordHint": "Gwiritsani ntchito zilembo 10 kapena kupitirira, zokhala ndi zilembo ndi manambala.",
+    "changePasswordHint": "Gwiritsani ntchito zilembo 6 kapena kupitirira, zokhala ndi zilembo ndi manambala.",
     "confirmPassword": "Tsimikizani mawu achinsinsi atsopano",
     "passwordsDoNotMatch": "Mawu achinsinsi sagwirizana"
   },
@@ -276,6 +276,9 @@
     "custom": "Lipoti la nthawi yosankhidwa",
     "exportPdf": "Tulutsani PDF",
     "exportExcel": "Tulutsani Excel",
+    "generatingPdf": "Tikupanga PDF...",
+    "exportFailed": "Lipoti silinathe kupangidwa.",
+    "generatedAt": "Zapangidwa",
     "revenue": "Ndalama zolowa",
     "sales": "Zogulitsa",
     "expenses": "Ndalama zogwiritsidwa ntchito",

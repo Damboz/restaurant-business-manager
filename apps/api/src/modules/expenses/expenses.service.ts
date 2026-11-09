@@ -7,6 +7,7 @@ import {
 } from "../../lib/business-date.js";
 import { assertDayOpen } from "../../lib/day-lock.js";
 import { query, transaction } from "../../lib/db.js";
+import { refreshClosedDaySnapshot } from "../closings/closings.service.js";
 import { decimal } from "../../lib/decimal.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../../lib/errors.js";
 import { nextDocumentNumber } from "../../lib/sequence.js";
@@ -400,6 +401,8 @@ export async function voidExpense(
   reason: string,
   meta: AuditMeta
 ) {
+  let voidedBusinessDate: string | null = null;
+
   await transaction(async (client) => {
     const { rows } = await client.query<{
       id: string;
@@ -420,7 +423,7 @@ export async function voidExpense(
       throw new BadRequestError("This expense is already voided");
     }
 
-    await assertDayOpen(client, restaurantId, expense.business_date);
+    voidedBusinessDate = expense.business_date;
 
     await client.query(
       `UPDATE expenses
@@ -441,6 +444,10 @@ export async function voidExpense(
       ...meta
     });
   });
+
+  if (voidedBusinessDate) {
+    await refreshClosedDaySnapshot(restaurantId, voidedBusinessDate);
+  }
 
   return loadExpense(restaurantId, expenseId);
 }

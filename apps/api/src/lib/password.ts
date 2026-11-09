@@ -1,7 +1,7 @@
 import bcrypt from "bcryptjs";
 import { env } from "../config/env.js";
 
-export const PASSWORD_MIN_LENGTH = 10;
+export const PASSWORD_MIN_LENGTH = 6;
 export const PASSWORD_MAX_LENGTH = 128;
 const BCRYPT_MAX_BYTES = 72;
 
